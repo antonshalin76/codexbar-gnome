@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CodexBar GNOME Indicator
+Comment=Show Codex and Claude usage limits in the GNOME top bar
+Exec=@HOME@/.local/bin/codexbar-gnome-indicator
+Icon=utilities-system-monitor
+Terminal=false
+X-GNOME-Autostart-enabled=true
+Categories=Utility;
