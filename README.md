@@ -2,19 +2,30 @@
 
 GNOME/AppIndicator tray wrapper for the [CodexBar CLI](https://github.com/steipete/CodexBar).
 
-It shows the three limits I want visible in the Ubuntu/GNOME top bar:
+It shows Codex and Claude Code limits in the Ubuntu/GNOME top bar and popup menu.
+
+Panel label:
 
 - `CxW` — Codex weekly usage
 - `ClS` — Claude Code session usage
 - `ClW` — Claude Code weekly usage
 
-Example panel text:
+Example:
 
 ```text
 CxW 70%  ClS 100%  ClW 39%
 ```
 
-The menu keeps a compact summary, a manual refresh action, and a details window with the raw CodexBar JSON.
+Popup rows use compact progress bars and reset text:
+
+```text
+█░░░░░░░░░    3%  Codex Week · resets Jul 22 at 6:04 AM
+░░░░░░░░░░    0%  Claude Session
+████░░░░░░   40%  Claude Week · resets Jul 20 at 3:59PM
+██████░░░░   60%  Fable · resets Jul 20 at 3:59PM
+```
+
+The indicator applies a dark GTK menu style. Some GNOME AppIndicator implementations may still use the shell theme for menu chrome; the progress rows remain visible either way.
 
 ## Why this exists
 
