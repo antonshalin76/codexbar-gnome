@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GNOME/AppIndicator wrapper for the CodexBar CLI."""
+"""Small GNOME/AppIndicator wrapper for CodexBar CLI."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 import os
 import subprocess
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
-from gi.repository import GLib, Gtk  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 
 APP_ID = "codexbar-gnome-indicator"
@@ -24,6 +24,8 @@ CODEXBAR = os.environ.get("CODEXBAR_BIN", str(Path.home() / ".local/bin/codexbar
 PROVIDER = os.environ.get("CODEXBAR_INDICATOR_PROVIDER", "both")
 SOURCE = os.environ.get("CODEXBAR_INDICATOR_SOURCE", "oauth")
 REFRESH_SECONDS = int(os.environ.get("CODEXBAR_INDICATOR_REFRESH_SECONDS", "300"))
+MAX_LIMIT_ROWS = 8
+BAR_WIDTH = 10
 
 
 def _run_codexbar() -> tuple[list[dict[str, Any]] | None, str | None, str]:
@@ -32,7 +34,6 @@ def _run_codexbar() -> tuple[list[dict[str, Any]] | None, str | None, str]:
         cmd.extend(["--provider", PROVIDER])
     if SOURCE:
         cmd.extend(["--source", SOURCE])
-
     try:
         proc = subprocess.run(cmd, text=True, capture_output=True, timeout=90, check=False)
     except Exception as exc:
@@ -62,11 +63,11 @@ def _window_percent(window: dict[str, Any] | None) -> int | None:
     return None
 
 
-def _summarize_provider(item: dict[str, Any]) -> tuple[str, str, bool]:
+def _summarize_provider(item: dict[str, Any]) -> tuple[str, str, int | None, bool]:
     provider = str(item.get("provider") or "?")
     if isinstance(item.get("error"), dict):
         msg = str(item["error"].get("message") or "provider error")
-        return provider, f"{provider}: ERROR: {msg}", True
+        return provider, f"{provider}: ERROR: {msg}", None, True
 
     usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
     windows: list[tuple[str, int | None, str | None]] = [
@@ -82,20 +83,63 @@ def _summarize_provider(item: dict[str, Any]) -> tuple[str, str, bool]:
 
     present = [(name, pct, reset) for name, pct, reset in windows if pct is not None]
     if not present:
-        return provider, f"{provider}: no usage windows", False
+        return provider, f"{provider}: no usage windows", None, False
 
     headline_name, headline_pct, _ = present[0]
+    max_pct = max(pct for _, pct, _ in present if pct is not None)
     parts = [f"{name} {pct}%" + (f" reset {reset}" if reset else "") for name, pct, reset in present]
     account = usage.get("accountEmail") or usage.get("identity", {}).get("accountEmail")
-    prefix = provider
+    prefix = f"{provider}"
     if account:
         prefix += f" ({account})"
-    return provider, f"{prefix}: {headline_name} {headline_pct}% | " + " | ".join(parts), False
+    return provider, f"{prefix}: {headline_name} {headline_pct}% | " + " | ".join(parts), max_pct, False
 
 
 def _compact_summary(summary: str) -> str:
     head = summary.split(" | ", 1)[0]
     return head.replace(": ERROR:", " ERR:")
+
+
+def _install_dark_menu_css() -> None:
+    screen = Gdk.Screen.get_default()
+    if screen is None:
+        return
+    provider = Gtk.CssProvider()
+    provider.load_from_data(
+        b"""
+        menu {
+          background: #151518;
+          border: 1px solid #2a2a2e;
+          border-radius: 14px;
+          padding: 10px;
+        }
+        menuitem {
+          color: #e8e4dc;
+          background: transparent;
+          border-radius: 8px;
+          padding: 7px 12px;
+          font-family: monospace;
+          font-size: 12px;
+        }
+        menuitem:hover {
+          background: #2a2a2e;
+          color: #ffffff;
+        }
+        menuitem:disabled {
+          color: #e8e4dc;
+        }
+        separator {
+          background: #36363b;
+          min-height: 1px;
+          margin: 8px 0;
+        }
+        """
+    )
+    Gtk.StyleContext.add_provider_for_screen(
+        screen,
+        provider,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+    )
 
 
 def _panel_label(payload: list[dict[str, Any]], has_error: bool) -> str:
@@ -117,6 +161,74 @@ def _panel_label(payload: list[dict[str, Any]], has_error: bool) -> str:
         claude_weekly=lane("claude", "secondary"),
     )
     return label + (" !" if has_error else "")
+
+
+def _bar(percent: int | None) -> str:
+    if percent is None:
+        return "░" * BAR_WIDTH
+    filled = max(0, min(BAR_WIDTH, round((percent / 100) * BAR_WIDTH)))
+    if percent > 0 and filled == 0:
+        filled = 1
+    return "█" * filled + "░" * (BAR_WIDTH - filled)
+
+
+def _short_reset(window: Any) -> str:
+    if not isinstance(window, dict):
+        return ""
+    text = _reset_text(window)
+    return f" · resets {text}" if text else ""
+
+
+def _limit_row(label: str, percent: int | None, window: Any) -> dict[str, Any]:
+    percent_text = "--" if percent is None else f"{percent}%"
+    return {
+        "label": label,
+        "percent": percent,
+        "text": f"{_bar(percent)}  {percent_text:>4}  {label}{_short_reset(window)}",
+    }
+
+
+def _collect_limit_rows(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_provider = {
+        str(item.get("provider") or ""): item
+        for item in payload
+        if isinstance(item, dict) and not isinstance(item.get("error"), dict)
+    }
+    rows: list[dict[str, Any]] = []
+
+    codex = by_provider.get("codex") or {}
+    codex_usage = codex.get("usage") if isinstance(codex.get("usage"), dict) else {}
+    codex_week = codex_usage.get("secondary")
+    if isinstance(codex_week, dict):
+        rows.append(_limit_row("Codex Week", _window_percent(codex_week), codex_week))
+
+    claude = by_provider.get("claude") or {}
+    claude_usage = claude.get("usage") if isinstance(claude.get("usage"), dict) else {}
+    claude_session = claude_usage.get("primary")
+    if isinstance(claude_session, dict):
+        rows.append(_limit_row("Claude Session", _window_percent(claude_session), claude_session))
+    claude_week = claude_usage.get("secondary")
+    if isinstance(claude_week, dict):
+        rows.append(_limit_row("Claude Week", _window_percent(claude_week), claude_week))
+
+    for item in payload:
+        provider = str(item.get("provider") or "")
+        usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
+        for extra in usage.get("extraRateWindows") or []:
+            if not isinstance(extra, dict):
+                continue
+            window = extra.get("window") if isinstance(extra.get("window"), dict) else {}
+            percent = _window_percent(window)
+            title = str(extra.get("title") or extra.get("id") or "extra")
+            normalized = title.lower()
+            if percent in (None, 0) and not any(token in normalized for token in ("fable", "opus", "sonnet")):
+                continue
+            display = title.replace(" only", "")
+            if provider == "codex":
+                display = f"Codex {display}"
+            rows.append(_limit_row(display, percent, window))
+
+    return rows[:MAX_LIMIT_ROWS]
 
 
 def _reset_text(window: Any) -> str | None:
@@ -145,7 +257,20 @@ class CodexBarIndicator:
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         self.indicator.set_title("CodexBar")
 
+        _install_dark_menu_css()
         self.menu = Gtk.Menu()
+        self.limit_items: list[Gtk.MenuItem] = []
+        for _ in range(MAX_LIMIT_ROWS):
+            item = Gtk.MenuItem(label="")
+            item.set_sensitive(False)
+            item.hide()
+            self.menu.append(item)
+            self.limit_items.append(item)
+
+        self.limit_separator = Gtk.SeparatorMenuItem()
+        self.limit_separator.hide()
+        self.menu.append(self.limit_separator)
+
         self.status_item = Gtk.MenuItem(label="CodexBar: starting...")
         self.status_item.set_sensitive(False)
         self.menu.append(self.status_item)
@@ -170,8 +295,22 @@ class CodexBarIndicator:
         self.refresh()
         GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh)
 
+    def _set_limit_rows(self, rows: list[dict[str, Any]]) -> None:
+        for item, row in zip(self.limit_items, rows):
+            item.set_label(str(row["text"]))
+            item.show()
+        for item in self.limit_items[len(rows):]:
+            item.hide()
+        if rows:
+            self.limit_separator.show()
+            self.status_item.hide()
+        else:
+            self.limit_separator.hide()
+            self.status_item.show()
+
     def refresh(self, *_: object) -> bool:
-        self.status_item.set_label("CodexBar: refreshing...")
+        if not self.last_raw:
+            self.status_item.set_label("CodexBar: refreshing...")
         threading.Thread(target=self._refresh_worker, daemon=True).start()
         return True
 
@@ -183,6 +322,8 @@ class CodexBarIndicator:
         if error:
             self.last_summary = f"CodexBar: ERROR: {error}"
             self.indicator.set_label("CB !", "CB 100%")
+            self._set_limit_rows([])
+            self.status_item.show()
             self.status_item.set_label(self.last_summary[:180])
             if raw:
                 self.last_raw = raw
@@ -192,14 +333,17 @@ class CodexBarIndicator:
         summaries: list[str] = []
         has_error = False
         for item in payload:
-            _, summary, item_error = _summarize_provider(item)
+            _, summary, _, item_error = _summarize_provider(item)
             summaries.append(summary)
             has_error = has_error or item_error
 
         label = _panel_label(payload, has_error)
+        limit_rows = _collect_limit_rows(payload)
+
         self.last_raw = raw
         self.last_summary = "\n".join(summaries) if summaries else "CodexBar: no providers returned"
         self.indicator.set_label(label, "CxW 100%  ClS 100%  ClW 100%")
+        self._set_limit_rows(limit_rows)
         self.status_item.set_label("; ".join(_compact_summary(s) for s in summaries)[:180])
         return False
 
