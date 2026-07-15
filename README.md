@@ -138,6 +138,16 @@ Environment variables:
 
 ## Verify
 
+Run the full local gate before committing or publishing changes:
+
+```bash
+scripts/install-git-hooks.sh
+scripts/quality-gate.sh
+```
+
+The gate checks Python syntax, shell syntax, optional ShellCheck, and the local
+SonarQube quality gate configured by `sonar-project.properties`.
+
 Check syntax:
 
 ```bash
