@@ -21,37 +21,124 @@ from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 APP_ID = "codexbar-gnome-indicator"
 CODEXBAR = os.environ.get("CODEXBAR_BIN", str(Path.home() / ".local/bin/codexbar"))
-PROVIDER = os.environ.get("CODEXBAR_INDICATOR_PROVIDER", "both")
 SOURCE = os.environ.get("CODEXBAR_INDICATOR_SOURCE", "oauth")
 REFRESH_SECONDS = int(os.environ.get("CODEXBAR_INDICATOR_REFRESH_SECONDS", "300"))
 MAX_LIMIT_ROWS = 8
 BAR_WIDTH = 10
+CONFIG_PATH = Path(os.environ.get("CODEXBAR_GNOME_CONFIG", str(Path.home() / ".config/codexbar-gnome/config.json")))
+RUNTIMES = ("codex", "claude")
+RUNTIME_LABELS = {
+    "codex": "Codex",
+    "claude": "Claude",
+}
+DEFAULT_SETTINGS = {
+    "runtimes": {
+        "codex": {"poll": True, "autoRefresh": True},
+        "claude": {"poll": False, "autoRefresh": False},
+    }
+}
 
 
-def _run_codexbar() -> tuple[list[dict[str, Any]] | None, str | None, str]:
+def _normalized_settings(raw: Any) -> dict[str, Any]:
+    settings = json.loads(json.dumps(DEFAULT_SETTINGS))
+    if not isinstance(raw, dict):
+        return settings
+    runtimes = raw.get("runtimes")
+    if not isinstance(runtimes, dict):
+        return settings
+    for runtime in RUNTIMES:
+        runtime_raw = runtimes.get(runtime)
+        if not isinstance(runtime_raw, dict):
+            continue
+        target = settings["runtimes"][runtime]
+        if "poll" in runtime_raw:
+            target["poll"] = bool(runtime_raw["poll"])
+        if "autoRefresh" in runtime_raw:
+            target["autoRefresh"] = bool(runtime_raw["autoRefresh"])
+        if not target["poll"]:
+            target["autoRefresh"] = False
+    return settings
+
+
+def _load_settings() -> dict[str, Any]:
+    try:
+        return _normalized_settings(json.loads(CONFIG_PATH.read_text()))
+    except FileNotFoundError:
+        return _normalized_settings(None)
+    except Exception:
+        return _normalized_settings(None)
+
+
+def _save_settings(settings: dict[str, Any]) -> None:
+    normalized = _normalized_settings(settings)
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(normalized, indent=2, sort_keys=True) + "\n")
+
+
+def _enabled_providers(settings: dict[str, Any], *, auto_only: bool) -> list[str]:
+    runtimes = _normalized_settings(settings)["runtimes"]
+    providers: list[str] = []
+    for runtime in RUNTIMES:
+        config = runtimes[runtime]
+        if not config["poll"]:
+            continue
+        if auto_only and not config["autoRefresh"]:
+            continue
+        providers.append(runtime)
+    return providers
+
+
+def _run_codexbar_provider(provider: str) -> tuple[list[dict[str, Any]], str]:
     cmd = [CODEXBAR, "usage", "--format", "json", "--no-color"]
-    if PROVIDER:
-        cmd.extend(["--provider", PROVIDER])
+    cmd.extend(["--provider", provider])
     if SOURCE:
         cmd.extend(["--source", SOURCE])
     try:
         proc = subprocess.run(cmd, text=True, capture_output=True, timeout=90, check=False)
     except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}", ""
+        return ([{
+            "provider": provider,
+            "error": {"code": 1, "kind": "runtime", "message": f"{type(exc).__name__}: {exc}"},
+        }], "")
 
     output = proc.stdout.strip()
     if proc.returncode != 0 and not output:
-        return None, (proc.stderr or f"codexbar exited with {proc.returncode}").strip(), ""
+        message = (proc.stderr or f"codexbar exited with {proc.returncode}").strip()
+        return ([{
+            "provider": provider,
+            "error": {"code": proc.returncode, "kind": "provider", "message": message},
+        }], "")
 
     try:
         payload = json.loads(output)
     except json.JSONDecodeError as exc:
         err = proc.stderr.strip() if proc.stderr else str(exc)
-        return None, err, output
+        return ([{
+            "provider": provider,
+            "error": {"code": 1, "kind": "parse", "message": err},
+        }], output)
 
     if not isinstance(payload, list):
-        return None, "Unexpected codexbar JSON shape", output
-    return payload, None, output
+        return ([{
+            "provider": provider,
+            "error": {"code": 1, "kind": "parse", "message": "Unexpected codexbar JSON shape"},
+        }], output)
+    return payload, output
+
+
+def _run_codexbar(providers: list[str]) -> tuple[list[dict[str, Any]] | None, str | None, str]:
+    if not providers:
+        return [], None, "[]"
+
+    combined: list[dict[str, Any]] = []
+    raw_parts: list[str] = []
+    for provider in providers:
+        payload, raw = _run_codexbar_provider(provider)
+        combined.extend(payload)
+        if raw:
+            raw_parts.append(raw)
+
+    return combined, None, json.dumps(combined, indent=2) if combined else "\n".join(raw_parts)
 
 
 def _window_percent(window: dict[str, Any] | None) -> int | None:
@@ -258,6 +345,9 @@ class CodexBarIndicator:
         self.indicator.set_title("CodexBar")
 
         _install_dark_menu_css()
+        self.settings = _load_settings()
+        _save_settings(self.settings)
+        self._syncing_settings = False
         self.menu = Gtk.Menu()
         self.limit_items: list[Gtk.MenuItem] = []
         for _ in range(MAX_LIMIT_ROWS):
@@ -279,8 +369,28 @@ class CodexBarIndicator:
         self.details_item.connect("activate", self.show_details)
         self.menu.append(self.details_item)
 
+        self.settings_separator = Gtk.SeparatorMenuItem()
+        self.menu.append(self.settings_separator)
+        self.settings_label_item = Gtk.MenuItem(label="Runtime limit polling")
+        self.settings_label_item.set_sensitive(False)
+        self.menu.append(self.settings_label_item)
+
+        self.setting_items: dict[tuple[str, str], Gtk.CheckMenuItem] = {}
+        for runtime in RUNTIMES:
+            runtime_label = RUNTIME_LABELS[runtime]
+            poll_item = Gtk.CheckMenuItem(label=f"Poll {runtime_label} limits")
+            poll_item.connect("toggled", self.on_setting_toggled, runtime, "poll")
+            self.menu.append(poll_item)
+            self.setting_items[(runtime, "poll")] = poll_item
+
+            auto_item = Gtk.CheckMenuItem(label=f"Auto-refresh {runtime_label}")
+            auto_item.connect("toggled", self.on_setting_toggled, runtime, "autoRefresh")
+            self.menu.append(auto_item)
+            self.setting_items[(runtime, "autoRefresh")] = auto_item
+
+        self.menu.append(Gtk.SeparatorMenuItem())
         self.refresh_item = Gtk.MenuItem(label="Refresh")
-        self.refresh_item.connect("activate", self.refresh)
+        self.refresh_item.connect("activate", self.refresh_manual)
         self.menu.append(self.refresh_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
@@ -292,8 +402,53 @@ class CodexBarIndicator:
 
         self.last_raw = ""
         self.last_summary = "CodexBar: starting..."
-        self.refresh()
-        GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh)
+        self.sync_settings_menu()
+        self.refresh_auto()
+        GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh_auto)
+
+    def sync_settings_menu(self) -> None:
+        self._syncing_settings = True
+        normalized = _normalized_settings(self.settings)
+        for runtime in RUNTIMES:
+            runtime_settings = normalized["runtimes"][runtime]
+            poll_item = self.setting_items[(runtime, "poll")]
+            auto_item = self.setting_items[(runtime, "autoRefresh")]
+            poll_item.set_active(bool(runtime_settings["poll"]))
+            auto_item.set_active(bool(runtime_settings["autoRefresh"]))
+            auto_item.set_sensitive(bool(runtime_settings["poll"]))
+        self.refresh_item.set_sensitive(bool(_enabled_providers(self.settings, auto_only=False)))
+        self._syncing_settings = False
+
+    def on_setting_toggled(self, item: Gtk.CheckMenuItem, runtime: str, key: str) -> None:
+        if self._syncing_settings:
+            return
+        self.settings = _normalized_settings(self.settings)
+        runtime_settings = self.settings["runtimes"][runtime]
+        enabled = bool(item.get_active())
+        if key == "poll":
+            runtime_settings["poll"] = enabled
+            if not enabled:
+                runtime_settings["autoRefresh"] = False
+        else:
+            runtime_settings["autoRefresh"] = enabled
+            if enabled:
+                runtime_settings["poll"] = True
+        _save_settings(self.settings)
+        self.sync_settings_menu()
+        if key == "poll" and not enabled:
+            self.remove_runtime_from_current_view(runtime)
+        if key == "autoRefresh" and enabled:
+            self.refresh_auto()
+
+    def remove_runtime_from_current_view(self, runtime: str) -> None:
+        try:
+            payload = json.loads(self.last_raw)
+        except Exception:
+            return
+        if not isinstance(payload, list):
+            return
+        filtered = [item for item in payload if item.get("provider") != runtime]
+        self._apply_refresh(filtered, None, json.dumps(filtered, indent=2))
 
     def _set_limit_rows(self, rows: list[dict[str, Any]]) -> None:
         for item, row in zip(self.limit_items, rows):
@@ -308,14 +463,28 @@ class CodexBarIndicator:
             self.limit_separator.hide()
             self.status_item.show()
 
-    def refresh(self, *_: object) -> bool:
+    def refresh_auto(self, *_: object) -> bool:
+        return self.refresh(auto_only=True)
+
+    def refresh_manual(self, *_: object) -> bool:
+        return self.refresh(auto_only=False)
+
+    def refresh(self, *, auto_only: bool) -> bool:
+        providers = _enabled_providers(self.settings, auto_only=auto_only)
+        if not providers:
+            self._apply_refresh([], None, "[]")
+            mode = "Auto-refresh" if auto_only else "Polling"
+            self.status_item.show()
+            self.status_item.set_label(f"{mode} disabled")
+            self.indicator.set_label("CB off", "CB off")
+            return True
         if not self.last_raw:
             self.status_item.set_label("CodexBar: refreshing...")
-        threading.Thread(target=self._refresh_worker, daemon=True).start()
+        threading.Thread(target=self._refresh_worker, args=(providers,), daemon=True).start()
         return True
 
-    def _refresh_worker(self) -> None:
-        payload, error, raw = _run_codexbar()
+    def _refresh_worker(self, providers: list[str]) -> None:
+        payload, error, raw = _run_codexbar(providers)
         GLib.idle_add(self._apply_refresh, payload, error, raw)
 
     def _apply_refresh(self, payload: list[dict[str, Any]] | None, error: str | None, raw: str) -> bool:
