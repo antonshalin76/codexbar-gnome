@@ -2,7 +2,7 @@
 
 GNOME/AppIndicator tray wrapper for the [CodexBar CLI](https://github.com/steipete/CodexBar).
 
-It shows Codex and Claude Code limits in the Ubuntu/GNOME top bar and popup menu.
+It shows selected Codex and Claude Code limits in the Ubuntu/GNOME top bar and popup menu.
 
 Panel label:
 
@@ -31,13 +31,7 @@ The indicator applies a dark GTK menu style. Some GNOME AppIndicator implementat
 
 CodexBar-KDE is a Plasma 6 plasmoid. This project provides a small GNOME-friendly surface for the same data: a Python GTK/Ayatana AppIndicator that shells out to `codexbar usage`.
 
-On Linux, Claude Code `auto` source may fall back to `claude /usage`, which can return a subscription notice without quota windows. This indicator defaults to:
-
-```bash
-codexbar usage --format json --no-color --provider both --source oauth
-```
-
-That gives usable Codex and Claude quota windows when both OAuth logins are available.
+The indicator polls runtimes independently instead of using `--provider both`. This lets users disable Claude polling while keeping Codex visible, or keep Claude available only for manual refreshes.
 
 ## Requirements
 
@@ -49,7 +43,7 @@ That gives usable Codex and Claude quota windows when both OAuth logins are avai
   - `gir1.2-ayatanaappindicator3-0.1`
 - `zenity` for the details window
 - [CodexBar CLI](https://github.com/steipete/CodexBar) available as `~/.local/bin/codexbar` or on `PATH`
-- CodexBar configured for Codex and Claude OAuth usage
+- CodexBar configured for the providers you want to poll
 
 On Ubuntu:
 
@@ -72,9 +66,43 @@ The installer writes:
 - `~/.local/share/applications/codexbar-gnome-indicator.desktop`
 - `~/.config/autostart/codexbar-gnome-indicator.desktop`
 
+## Runtime polling settings
+
+Open the tray menu and use the `Runtime limit polling` section:
+
+- `Poll Codex limits` — enables/disables all Codex limit requests.
+- `Auto-refresh Codex` — enables/disables timer refresh for Codex only.
+- `Poll Claude limits` — enables/disables all Claude limit requests.
+- `Auto-refresh Claude` — enables/disables timer refresh for Claude only.
+
+`Refresh` only polls runtimes whose `Poll ... limits` switch is enabled. Timer refresh only polls runtimes whose `Auto-refresh ...` switch is enabled.
+
+Current safe defaults:
+
+```json
+{
+  "runtimes": {
+    "codex": {
+      "poll": true,
+      "autoRefresh": true
+    },
+    "claude": {
+      "poll": false,
+      "autoRefresh": false
+    }
+  }
+}
+```
+
+Settings are persisted in:
+
+```text
+~/.config/codexbar-gnome/config.json
+```
+
 ## Configure CodexBar
 
-Enable both providers:
+Enable the providers you plan to poll:
 
 ```bash
 codexbar config enable --provider codex
@@ -91,7 +119,7 @@ For Claude on Linux, set OAuth as the source if `auto` falls back to the local C
 }
 ```
 
-The config file is usually:
+The CodexBar config file is usually:
 
 ```text
 ~/.config/codexbar/config.json
@@ -104,9 +132,9 @@ Environment variables:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CODEXBAR_BIN` | `~/.local/bin/codexbar` | CodexBar binary path |
-| `CODEXBAR_INDICATOR_PROVIDER` | `both` | Provider passed to `codexbar usage` |
 | `CODEXBAR_INDICATOR_SOURCE` | `oauth` | Source passed to `codexbar usage` |
 | `CODEXBAR_INDICATOR_REFRESH_SECONDS` | `300` | Refresh interval |
+| `CODEXBAR_GNOME_CONFIG` | `~/.config/codexbar-gnome/config.json` | Indicator settings path |
 
 ## Verify
 
@@ -116,10 +144,11 @@ Check syntax:
 python3 -m py_compile bin/codexbar-gnome-indicator
 ```
 
-Check CodexBar data:
+Check CodexBar data for a specific runtime:
 
 ```bash
-codexbar usage --format json --no-color --provider both --source oauth --pretty
+codexbar usage --format json --no-color --provider codex --source oauth --pretty
+codexbar usage --format json --no-color --provider claude --source oauth --pretty
 ```
 
 ## Uninstall
