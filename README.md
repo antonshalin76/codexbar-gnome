@@ -2,26 +2,24 @@
 
 GNOME/AppIndicator tray wrapper for the [CodexBar CLI](https://github.com/steipete/CodexBar).
 
-It shows selected Codex and Claude Code limits in the Ubuntu/GNOME top bar and popup menu.
+It shows selected Codex, Grok, and optional legacy Claude Code limits in the Ubuntu/GNOME top bar and popup menu.
 
 Panel label:
 
 - `CxW` — Codex weekly usage
-- `ClS` — Claude Code session usage
-- `ClW` — Claude Code weekly usage
+- `GkS` — Grok session usage
 
 Example:
 
 ```text
-CxW 70%  ClS 100%  ClW 39%
+CxW 70%  GkS 12%
 ```
 
 Popup rows use compact progress bars and reset text:
 
 ```text
 █░░░░░░░░░    3%  Codex Week · resets Jul 22 at 6:04 AM
-░░░░░░░░░░    0%  Claude Session
-████░░░░░░   40%  Claude Week · resets Jul 20 at 3:59PM
+█░░░░░░░░░   12%  Grok Session · resets Aug 29 08:00
 ██████░░░░   60%  Fable · resets Jul 20 at 3:59PM
 ```
 
@@ -31,7 +29,8 @@ The indicator applies a dark GTK menu style. Some GNOME AppIndicator implementat
 
 CodexBar-KDE is a Plasma 6 plasmoid. This project provides a small GNOME-friendly surface for the same data: a Python GTK/Ayatana AppIndicator that shells out to `codexbar usage`.
 
-The indicator polls runtimes independently instead of using `--provider both`. This lets users disable Claude polling while keeping Codex visible, or keep Claude available only for manual refreshes.
+The indicator polls runtimes independently. Codex and Grok are enabled by default;
+legacy Claude polling remains available but disabled.
 
 ## Requirements
 
@@ -72,6 +71,8 @@ Open the tray menu and use the `Runtime limit polling` section:
 
 - `Poll Codex limits` — enables/disables all Codex limit requests.
 - `Auto-refresh Codex` — enables/disables timer refresh for Codex only.
+- `Poll Grok limits` — enables/disables all Grok limit requests.
+- `Auto-refresh Grok` — enables/disables timer refresh for Grok only.
 - `Poll Claude limits` — enables/disables all Claude limit requests.
 - `Auto-refresh Claude` — enables/disables timer refresh for Claude only.
 
@@ -83,6 +84,10 @@ Current safe defaults:
 {
   "runtimes": {
     "codex": {
+      "poll": true,
+      "autoRefresh": true
+    },
+    "grok": {
       "poll": true,
       "autoRefresh": true
     },
@@ -106,7 +111,7 @@ Enable the providers you plan to poll:
 
 ```bash
 codexbar config enable --provider codex
-codexbar config enable --provider claude
+codexbar config enable --provider grok
 ```
 
 For Claude on Linux, set OAuth as the source if `auto` falls back to the local Claude CLI and cannot parse quota windows:
@@ -132,7 +137,7 @@ Environment variables:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CODEXBAR_BIN` | `~/.local/bin/codexbar` | CodexBar binary path |
-| `CODEXBAR_INDICATOR_SOURCE` | `oauth` | Source passed to `codexbar usage` |
+| `CODEXBAR_INDICATOR_SOURCE` | `auto` | Source passed to `codexbar usage`; legacy `oauth` automatically falls back to `auto` for Grok |
 | `CODEXBAR_INDICATOR_REFRESH_SECONDS` | `300` | Refresh interval |
 | `CODEXBAR_GNOME_CONFIG` | `~/.config/codexbar-gnome/config.json` | Indicator settings path |
 
@@ -145,7 +150,7 @@ scripts/install-git-hooks.sh
 scripts/quality-gate.sh
 ```
 
-The gate checks Python syntax, shell syntax, optional ShellCheck, and the local
+The gate checks Python syntax, unit tests, shell syntax, optional ShellCheck, and the local
 SonarQube quality gate configured by `sonar-project.properties`.
 
 Check syntax:
@@ -157,8 +162,8 @@ python3 -m py_compile bin/codexbar-gnome-indicator
 Check CodexBar data for a specific runtime:
 
 ```bash
-codexbar usage --format json --no-color --provider codex --source oauth --pretty
-codexbar usage --format json --no-color --provider claude --source oauth --pretty
+codexbar usage --format json --no-color --provider codex --source auto --pretty
+codexbar usage --format json --no-color --provider grok --source auto --pretty
 ```
 
 ## Uninstall

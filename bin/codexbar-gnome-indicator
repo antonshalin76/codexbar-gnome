@@ -21,19 +21,21 @@ from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 APP_ID = "codexbar-gnome-indicator"
 CODEXBAR = os.environ.get("CODEXBAR_BIN", str(Path.home() / ".local/bin/codexbar"))
-SOURCE = os.environ.get("CODEXBAR_INDICATOR_SOURCE", "oauth")
+SOURCE = os.environ.get("CODEXBAR_INDICATOR_SOURCE", "auto")
 REFRESH_SECONDS = int(os.environ.get("CODEXBAR_INDICATOR_REFRESH_SECONDS", "300"))
 MAX_LIMIT_ROWS = 8
 BAR_WIDTH = 10
 CONFIG_PATH = Path(os.environ.get("CODEXBAR_GNOME_CONFIG", str(Path.home() / ".config/codexbar-gnome/config.json")))
-RUNTIMES = ("codex", "claude")
+RUNTIMES = ("codex", "grok", "claude")
 RUNTIME_LABELS = {
     "codex": "Codex",
+    "grok": "Grok",
     "claude": "Claude",
 }
 DEFAULT_SETTINGS = {
     "runtimes": {
         "codex": {"poll": True, "autoRefresh": True},
+        "grok": {"poll": True, "autoRefresh": True},
         "claude": {"poll": False, "autoRefresh": False},
     }
 }
@@ -91,8 +93,9 @@ def _enabled_providers(settings: dict[str, Any], *, auto_only: bool) -> list[str
 def _run_codexbar_provider(provider: str) -> tuple[list[dict[str, Any]], str]:
     cmd = [CODEXBAR, "usage", "--format", "json", "--no-color"]
     cmd.extend(["--provider", provider])
-    if SOURCE:
-        cmd.extend(["--source", SOURCE])
+    source = "auto" if provider == "grok" and SOURCE == "oauth" else SOURCE
+    if source:
+        cmd.extend(["--source", source])
     try:
         proc = subprocess.run(cmd, text=True, capture_output=True, timeout=90, check=False)
     except Exception as exc:
@@ -242,10 +245,9 @@ def _panel_label(payload: list[dict[str, Any]], has_error: bool) -> str:
         percent = _window_percent(usage.get(window_key))
         return "--" if percent is None else f"{percent}%"
 
-    label = "CxW {codex_weekly}  ClS {claude_session}  ClW {claude_weekly}".format(
+    label = "CxW {codex_weekly}  GkS {grok_session}".format(
         codex_weekly=lane("codex", "secondary"),
-        claude_session=lane("claude", "primary"),
-        claude_weekly=lane("claude", "secondary"),
+        grok_session=lane("grok", "primary"),
     )
     return label + (" !" if has_error else "")
 
@@ -288,6 +290,15 @@ def _collect_limit_rows(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
     codex_week = codex_usage.get("secondary")
     if isinstance(codex_week, dict):
         rows.append(_limit_row("Codex Week", _window_percent(codex_week), codex_week))
+
+    grok = by_provider.get("grok") or {}
+    grok_usage = grok.get("usage") if isinstance(grok.get("usage"), dict) else {}
+    grok_session = grok_usage.get("primary")
+    if isinstance(grok_session, dict):
+        rows.append(_limit_row("Grok Session", _window_percent(grok_session), grok_session))
+    grok_week = grok_usage.get("secondary")
+    if isinstance(grok_week, dict):
+        rows.append(_limit_row("Grok Week", _window_percent(grok_week), grok_week))
 
     claude = by_provider.get("claude") or {}
     claude_usage = claude.get("usage") if isinstance(claude.get("usage"), dict) else {}
@@ -511,7 +522,7 @@ class CodexBarIndicator:
 
         self.last_raw = raw
         self.last_summary = "\n".join(summaries) if summaries else "CodexBar: no providers returned"
-        self.indicator.set_label(label, "CxW 100%  ClS 100%  ClW 100%")
+        self.indicator.set_label(label, "CxW 100%  GkS 100%")
         self._set_limit_rows(limit_rows)
         self.status_item.set_label("; ".join(_compact_summary(s) for s in summaries)[:180])
         return False

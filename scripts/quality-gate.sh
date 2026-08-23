@@ -10,6 +10,9 @@ git diff --check
 echo "==> Python syntax"
 python3 -m py_compile bin/codexbar-gnome-indicator
 
+echo "==> Python unit tests"
+python3 -m unittest discover -s tests -v
+
 echo "==> Shell syntax"
 sh -n install.sh
 sh -n uninstall.sh
@@ -30,6 +33,9 @@ fi
 
 host_url=${SONAR_HOST_URL:-http://localhost:9000}
 container_url=${SONARQUBE_URL:-http://host.docker.internal:9000}
+if [ -n "${SONAR_DOCKER_NETWORK_CONTAINER:-}" ] && [ -z "${SONARQUBE_URL:-}" ]; then
+  container_url=http://127.0.0.1:9000
+fi
 token=${SONAR_TOKEN:-${SONARQUBE_TOKEN:-}}
 geek_sonar=/home/anton/Source/geek/scripts/sonar-local.mjs
 geek_sonar_env=/home/anton/Source/geek/.sonar/local.env
@@ -52,8 +58,14 @@ if [ -z "$token" ]; then
   exit 1
 fi
 
-docker run --rm \
-  --add-host=host.docker.internal:host-gateway \
+docker_args=(--rm)
+if [ -n "${SONAR_DOCKER_NETWORK_CONTAINER:-}" ]; then
+  docker_args+=(--network "container:${SONAR_DOCKER_NETWORK_CONTAINER}")
+else
+  docker_args+=(--add-host=host.docker.internal:host-gateway)
+fi
+
+docker run "${docker_args[@]}" \
   -e "SONAR_HOST_URL=$container_url" \
   -e "SONAR_TOKEN=$token" \
   -v "$repo_root:/usr/src" \
