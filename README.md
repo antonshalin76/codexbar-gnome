@@ -2,17 +2,18 @@
 
 GNOME/AppIndicator tray wrapper for the [CodexBar CLI](https://github.com/steipete/CodexBar).
 
-It shows selected Codex, Grok, and optional legacy Claude Code limits in the Ubuntu/GNOME top bar and popup menu.
+It shows selected Codex, Grok, and Claude Code limits in the Ubuntu/GNOME top bar and popup menu.
 
 Panel label:
 
 - `CxW` — Codex weekly usage
 - `GkS` — Grok session usage
+- `Cl` — Claude Code usage: five-hour and longer Z.AI token windows, in that order
 
 Example:
 
 ```text
-CxW 70%  GkS 12%
+CxW 70%  GkS 12%  Cl 18%/96%
 ```
 
 Popup rows use compact progress bars and reset text:
@@ -20,6 +21,8 @@ Popup rows use compact progress bars and reset text:
 ```text
 █░░░░░░░░░    3%  Codex Week · resets Jul 22 at 6:04 AM
 █░░░░░░░░░   12%  Grok Session · resets Aug 29 08:00
+██░░░░░░░░   18%  Claude (Z.AI) 5h · resets Aug 29 01:42
+██████████   96%  Claude (Z.AI) period · resets Aug 31 04:13
 ██████░░░░   60%  Fable · resets Jul 20 at 3:59PM
 ```
 
@@ -64,6 +67,13 @@ The installer writes:
 - `~/.local/bin/codexbar-gnome-indicator`
 - `~/.local/share/applications/codexbar-gnome-indicator.desktop`
 - `~/.config/autostart/codexbar-gnome-indicator.desktop`
+
+Start or restart it from a graphical GNOME terminal:
+
+```bash
+pkill -f '^python3 ~/.local/bin/codexbar-gnome-indicator$'
+gtk-launch codexbar-gnome-indicator
+```
 
 ## Runtime polling settings
 
@@ -114,7 +124,7 @@ codexbar config enable --provider codex
 codexbar config enable --provider grok
 ```
 
-For Claude on Linux, set OAuth as the source if `auto` falls back to the local Claude CLI and cannot parse quota windows:
+For a Claude subscription on Linux, set OAuth as the source if `auto` falls back to the local Claude CLI and cannot parse quota windows:
 
 ```json
 {
@@ -130,16 +140,18 @@ The CodexBar config file is usually:
 ~/.config/codexbar/config.json
 ```
 
+When Claude Code uses Z.AI through `ANTHROPIC_BASE_URL=https://api.z.ai/...`, the indicator reads Z.AI's quota endpoint with the existing `ANTHROPIC_AUTH_TOKEN` from `~/.claude/settings.json`. It displays the returned token windows as `Claude (Z.AI)` rows and as `Cl <5h>/<period>` in the panel. It does not need Claude OAuth or an additional login. The token stays local and is sent only to `https://api.z.ai/api/monitor/usage/quota/limit`.
+
 ## Runtime options
 
 Environment variables:
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `CODEXBAR_BIN` | `~/.local/bin/codexbar` | CodexBar binary path |
-| `CODEXBAR_INDICATOR_SOURCE` | `auto` | Source passed to `codexbar usage`; legacy `oauth` automatically falls back to `auto` for Grok |
-| `CODEXBAR_INDICATOR_REFRESH_SECONDS` | `300` | Refresh interval |
-| `CODEXBAR_GNOME_CONFIG` | `~/.config/codexbar-gnome/config.json` | Indicator settings path |
+| Variable                               | Default                                  | Meaning                                                                                                                                                                 |
+| -------------------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CODEXBAR_BIN`                       | `~/.local/bin/codexbar`                | CodexBar binary path                                                                                                                                                    |
+| `CODEXBAR_INDICATOR_SOURCE`          | unset                                    | Optional source passed to`codexbar usage`; leave unset to use each provider's CodexBar configuration. Legacy `oauth` automatically falls back to `auto` for Grok. |
+| `CODEXBAR_INDICATOR_REFRESH_SECONDS` | `300`                                  | Refresh interval                                                                                                                                                        |
+| `CODEXBAR_GNOME_CONFIG`              | `~/.config/codexbar-gnome/config.json` | Indicator settings path                                                                                                                                                 |
 
 ## Verify
 
@@ -150,8 +162,7 @@ scripts/install-git-hooks.sh
 scripts/quality-gate.sh
 ```
 
-The gate checks Python syntax, unit tests, shell syntax, optional ShellCheck, and the local
-SonarQube quality gate configured by `sonar-project.properties`.
+The gate checks Python syntax, unit tests, shell syntax, and optional ShellCheck.
 
 Check syntax:
 

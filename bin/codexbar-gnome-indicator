@@ -10,6 +10,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import gi
 
@@ -21,11 +23,15 @@ from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 APP_ID = "codexbar-gnome-indicator"
 CODEXBAR = os.environ.get("CODEXBAR_BIN", str(Path.home() / ".local/bin/codexbar"))
-SOURCE = os.environ.get("CODEXBAR_INDICATOR_SOURCE", "auto")
+# Leave source selection to CodexBar by default.  In particular, its per-provider
+# Claude OAuth setting must not be overridden with the CLI's slow `auto` fallback.
+SOURCE = os.environ.get("CODEXBAR_INDICATOR_SOURCE", "")
 REFRESH_SECONDS = int(os.environ.get("CODEXBAR_INDICATOR_REFRESH_SECONDS", "300"))
 MAX_LIMIT_ROWS = 8
 BAR_WIDTH = 10
 CONFIG_PATH = Path(os.environ.get("CODEXBAR_GNOME_CONFIG", str(Path.home() / ".config/codexbar-gnome/config.json")))
+CLAUDE_SETTINGS_PATH = Path.home() / ".claude/settings.json"
+ZAI_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
 RUNTIMES = ("codex", "grok", "claude")
 RUNTIME_LABELS = {
     "codex": "Codex",
@@ -129,6 +135,62 @@ def _run_codexbar_provider(provider: str) -> tuple[list[dict[str, Any]], str]:
     return payload, output
 
 
+def _zai_claude_token() -> str | None:
+    try:
+        settings = json.loads(CLAUDE_SETTINGS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    environment = settings.get("env") if isinstance(settings, dict) else None
+    if not isinstance(environment, dict):
+        return None
+    base_url = environment.get("ANTHROPIC_BASE_URL")
+    token = environment.get("ANTHROPIC_AUTH_TOKEN")
+    if not isinstance(base_url, str) or not base_url.startswith("https://api.z.ai/"):
+        return None
+    return token if isinstance(token, str) and token else None
+
+
+def _zai_usage_payload(body: Any) -> list[dict[str, Any]]:
+    data = body.get("data") if isinstance(body, dict) else None
+    limits = data.get("limits") if isinstance(data, dict) else None
+    if not isinstance(limits, list):
+        return []
+    windows: list[dict[str, Any]] = []
+    for limit in limits:
+        if not isinstance(limit, dict) or limit.get("type") != "TOKENS_LIMIT":
+            continue
+        percentage = _window_percent({"usedPercent": limit.get("percentage")})
+        reset_at = limit.get("nextResetTime")
+        if percentage is None or not isinstance(reset_at, (int, float)):
+            continue
+        windows.append({
+            "usedPercent": percentage,
+            "resetsAt": datetime.fromtimestamp(reset_at / 1000, timezone.utc).isoformat(),
+        })
+    if not windows:
+        return []
+    usage: dict[str, Any] = {"primary": windows[0]}
+    if len(windows) > 1:
+        usage["secondary"] = windows[1]
+    return [{"provider": "claude", "source": "zai", "usage": usage}]
+
+
+def _run_zai_claude_limits(token: str) -> tuple[list[dict[str, Any]], str]:
+    request = Request(ZAI_QUOTA_URL, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+    try:
+        with urlopen(request, timeout=20) as response:
+            raw = response.read().decode("utf-8")
+    except (OSError, URLError) as exc:
+        return ([{"provider": "claude", "error": {"code": 1, "kind": "provider", "message": str(exc)}}], "")
+    try:
+        payload = _zai_usage_payload(json.loads(raw))
+    except json.JSONDecodeError as exc:
+        return ([{"provider": "claude", "error": {"code": 1, "kind": "parse", "message": str(exc)}}], raw)
+    if not payload:
+        return ([{"provider": "claude", "error": {"code": 1, "kind": "parse", "message": "Unexpected Z.AI quota JSON shape"}}], raw)
+    return payload, raw
+
+
 def _run_codexbar(providers: list[str]) -> tuple[list[dict[str, Any]] | None, str | None, str]:
     if not providers:
         return [], None, "[]"
@@ -136,7 +198,8 @@ def _run_codexbar(providers: list[str]) -> tuple[list[dict[str, Any]] | None, st
     combined: list[dict[str, Any]] = []
     raw_parts: list[str] = []
     for provider in providers:
-        payload, raw = _run_codexbar_provider(provider)
+        zai_token = _zai_claude_token() if provider == "claude" else None
+        payload, raw = _run_zai_claude_limits(zai_token) if zai_token else _run_codexbar_provider(provider)
         combined.extend(payload)
         if raw:
             raw_parts.append(raw)
@@ -249,6 +312,11 @@ def _panel_label(payload: list[dict[str, Any]], has_error: bool) -> str:
         codex_weekly=lane("codex", "secondary"),
         grok_session=lane("grok", "primary"),
     )
+    if "claude" in by_provider:
+        label += "  Cl {session}/{period}".format(
+            session=lane("claude", "primary"),
+            period=lane("claude", "secondary"),
+        )
     return label + (" !" if has_error else "")
 
 
@@ -302,12 +370,13 @@ def _collect_limit_rows(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     claude = by_provider.get("claude") or {}
     claude_usage = claude.get("usage") if isinstance(claude.get("usage"), dict) else {}
+    claude_zai = claude.get("source") == "zai"
     claude_session = claude_usage.get("primary")
     if isinstance(claude_session, dict):
-        rows.append(_limit_row("Claude Session", _window_percent(claude_session), claude_session))
+        rows.append(_limit_row("Claude (Z.AI) 5h" if claude_zai else "Claude Session", _window_percent(claude_session), claude_session))
     claude_week = claude_usage.get("secondary")
     if isinstance(claude_week, dict):
-        rows.append(_limit_row("Claude Week", _window_percent(claude_week), claude_week))
+        rows.append(_limit_row("Claude (Z.AI) period" if claude_zai else "Claude Week", _window_percent(claude_week), claude_week))
 
     for item in payload:
         provider = str(item.get("provider") or "")
@@ -539,8 +608,9 @@ class CodexBarIndicator:
 
 
 def main() -> None:
-    CodexBarIndicator()
+    indicator = CodexBarIndicator()
     Gtk.main()
+    del indicator
 
 
 if __name__ == "__main__":
