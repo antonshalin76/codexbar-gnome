@@ -1,43 +1,301 @@
 #!/usr/bin/env python3
-"""Small GNOME/AppIndicator wrapper for CodexBar CLI."""
+"""GNOME AppIndicator front end for CodexBar usage providers."""
 
 from __future__ import annotations
 
+import copy
+import ctypes
 import json
+import math
 import os
+import re
+import selectors
+import shutil
+import signal
+import stat
 import subprocess
+import sys
 import threading
-from datetime import datetime, timezone
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
-from urllib.error import URLError
-from urllib.request import Request, urlopen
+from urllib.parse import unquote, urlsplit
+
+MAX_CHILD_ENV_BYTES = 128 * 1024
+_CREDENTIAL_ENV_KEY = re.compile(
+    r"(?i)(?:api_?key|access_?token|auth_?token|token|secret|password|passwd|"
+    r"(?:^|_)pwd(?:$|_)|private_?key|credential|cookie|auth|session)"
+)
+_CREDENTIAL_CONTAINER_KEY = re.compile(r"(?i)(?:^|_)(?:url|uri|dsn)(?:$|_)")
+_EMBEDDED_CREDENTIAL = re.compile(
+    r"""(?ix)(?:password|passwd|token|secret|api[_-]?key|auth|private[_-]?key)
+    ["']?\s*[=:]\s*["']?([^"'\s;,}]+)"""
+)
+
+
+def _credential_values(environment: dict[str, str]) -> tuple[str, ...]:
+    secrets: list[str] = []
+    for key, value in environment.items():
+        if not value:
+            continue
+        if _CREDENTIAL_ENV_KEY.search(key) or _CREDENTIAL_CONTAINER_KEY.search(key):
+            secrets.append(value)
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            parsed = None
+        if parsed is not None and parsed.netloc:
+            for credential in (parsed.username, parsed.password):
+                if credential:
+                    secrets.append(unquote(credential))
+        secrets.extend(match.group(1) for match in _EMBEDDED_CREDENTIAL.finditer(value))
+    return tuple(dict.fromkeys(secrets))
+
+
+def _os_text_encodable(value: str) -> bool:
+    try:
+        os.fsencode(value)
+    except UnicodeError:
+        return False
+    return True
+
+
+def _signal_process_group(process_group: int, signum: int) -> None:
+    try:
+        os.killpg(process_group, signum)
+    except OSError:
+        pass
+
+
+def _direct_child_pids(parent_pid: int) -> tuple[int, ...]:
+    children: set[int] = set()
+    try:
+        tasks = tuple(Path(f"/proc/{parent_pid}/task").iterdir())
+    except OSError:
+        return ()
+    for task in tasks:
+        try:
+            children.update(
+                int(value) for value in (task / "children").read_text().split()
+            )
+        except (OSError, ValueError):
+            continue
+    return tuple(sorted(children))
+
+
+def _descendant_pids(root_pid: int) -> tuple[int, ...]:
+    descendants: list[int] = []
+    pending = [root_pid]
+    seen = {root_pid}
+    while pending:
+        parent = pending.pop()
+        for child in _direct_child_pids(parent):
+            if child in seen:
+                continue
+            seen.add(child)
+            descendants.append(child)
+            pending.append(child)
+    return tuple(descendants)
+
+
+def _adopted_child_pids() -> tuple[int, ...]:
+    return _direct_child_pids(os.getpid())
+
+
+def _stop_and_reap_adopted_children(signum: int, deadline: float) -> None:
+    """Drain descendants that escaped the provider's original process group."""
+    while True:
+        while True:
+            try:
+                pid, _status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if pid == 0:
+                break
+        for pid in _adopted_child_pids():
+            try:
+                os.kill(pid, signum)
+            except OSError:
+                pass
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.01)
+
+
+def _read_child_environment(environment_fd: int) -> dict[str, str]:
+    with os.fdopen(environment_fd, "rb", closefd=True) as stream:
+        payload = stream.read(MAX_CHILD_ENV_BYTES + 1)
+    if len(payload) > MAX_CHILD_ENV_BYTES:
+        raise ValueError("provider environment payload is too large")
+    decoded = json.loads(payload.decode("utf-8", errors="strict"))
+    if not isinstance(decoded, dict):
+        raise TypeError("provider environment payload must be an object")
+    for key, value in decoded.items():
+        if (
+            not isinstance(key, str)
+            or not key
+            or "=" in key
+            or "\x00" in key
+            or not isinstance(value, str)
+            or "\x00" in value
+            or not _os_text_encodable(key)
+            or not _os_text_encodable(value)
+        ):
+            raise ValueError("provider environment payload is invalid")
+    return decoded
+
+
+def _child_supervisor(
+    argv: tuple[str, ...],
+    expected_parent_pid: int,
+    environment_fd: int | None = None,
+) -> int:
+    """Own and reap one provider process tree, including after parent death."""
+    if not argv or expected_parent_pid <= 1 or not sys.platform.startswith("linux"):
+        print("child supervisor requires Linux and a command", file=sys.stderr)
+        return 64
+
+    libc = ctypes.CDLL(None, use_errno=True)
+
+    def wake_for_parent_check(_signum: int, _frame: object) -> None:
+        pass
+
+    signal.signal(signal.SIGCONT, wake_for_parent_check)
+    if os.getppid() != expected_parent_pid:
+        return 143
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        print("unable to enable child subreaper", file=sys.stderr)
+        return 70
+    if libc.prctl(1, signal.SIGCONT, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        print("unable to set parent-death signal", file=sys.stderr)
+        return 70
+    if os.getppid() != expected_parent_pid:
+        return 143
+
+    stopping = 0
+
+    def request_stop(signum: int, _frame: object) -> None:
+        nonlocal stopping
+        stopping = signum
+
+    for handled in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(handled, request_stop)
+
+    child_environment: dict[str, str] | None = None
+    if environment_fd is not None:
+        try:
+            child_environment = _read_child_environment(environment_fd)
+        except (OSError, UnicodeError, ValueError, TypeError) as environment_error:
+            print(
+                "unable to load provider environment: "
+                f"{type(environment_error).__name__}",
+                file=sys.stderr,
+            )
+            return 64
+        if os.getppid() != expected_parent_pid:
+            return 143
+
+    if os.getppid() != expected_parent_pid:
+        return 143
+
+    try:
+        child = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            env=child_environment,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"unable to start provider: {type(exc).__name__}", file=sys.stderr)
+        return 71
+
+    status: int | None = None
+    sent_term = False
+    term_deadline = 0.0
+    while status is None:
+        if not stopping and os.getppid() != expected_parent_pid:
+            stopping = signal.SIGTERM
+        if stopping and not sent_term:
+            _signal_process_group(child.pid, signal.SIGTERM)
+            sent_term = True
+            term_deadline = time.monotonic() + 0.5
+        if sent_term and time.monotonic() >= term_deadline:
+            _signal_process_group(child.pid, signal.SIGKILL)
+        try:
+            waited, raw_status = os.waitpid(child.pid, os.WNOHANG)
+        except ChildProcessError:
+            waited, raw_status = child.pid, 0
+        if waited == child.pid:
+            status = raw_status
+            break
+        time.sleep(0.01)
+
+    _signal_process_group(child.pid, signal.SIGTERM)
+    _stop_and_reap_adopted_children(signal.SIGTERM, time.monotonic() + 0.15)
+    _signal_process_group(child.pid, signal.SIGKILL)
+    _stop_and_reap_adopted_children(signal.SIGKILL, time.monotonic() + 1.0)
+
+    if stopping:
+        return 128 + stopping
+    return os.waitstatus_to_exitcode(status)
+
+
+# This branch must remain before importing GTK. Provider cleanup must work on a
+# headless machine and when the desktop process is killed with SIGKILL.
+if (
+    len(sys.argv) >= 7
+    and sys.argv[1] == "--child-supervisor-env-fd"
+    and sys.argv[3] == "--expected-parent-pid"
+    and sys.argv[5] == "--"
+):
+    try:
+        _supervised_environment_fd = int(sys.argv[2])
+        _supervised_parent_pid = int(sys.argv[4])
+    except ValueError:
+        raise SystemExit(64) from None
+    raise SystemExit(
+        _child_supervisor(
+            tuple(sys.argv[6:]),
+            _supervised_parent_pid,
+            _supervised_environment_fd,
+        )
+    )
+if (
+    len(sys.argv) >= 6
+    and sys.argv[1:3] == ["--child-supervisor", "--expected-parent-pid"]
+    and sys.argv[4] == "--"
+):
+    try:
+        _supervised_parent_pid = int(sys.argv[3])
+    except ValueError:
+        raise SystemExit(64) from None
+    raise SystemExit(_child_supervisor(tuple(sys.argv[5:]), _supervised_parent_pid))
+
 
 import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
-from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+from gi.repository import AyatanaAppIndicator3 as AppIndicator
+from gi.repository import Gio, GLib, Gtk
 
-
-APP_ID = "codexbar-gnome-indicator"
-CODEXBAR = os.environ.get("CODEXBAR_BIN", str(Path.home() / ".local/bin/codexbar"))
-# Leave source selection to CodexBar by default.  In particular, its per-provider
-# Claude OAuth setting must not be overridden with the CLI's slow `auto` fallback.
-SOURCE = os.environ.get("CODEXBAR_INDICATOR_SOURCE", "")
-REFRESH_SECONDS = int(os.environ.get("CODEXBAR_INDICATOR_REFRESH_SECONDS", "300"))
-MAX_LIMIT_ROWS = 8
-BAR_WIDTH = 10
-CONFIG_PATH = Path(os.environ.get("CODEXBAR_GNOME_CONFIG", str(Path.home() / ".config/codexbar-gnome/config.json")))
-CLAUDE_SETTINGS_PATH = Path.home() / ".claude/settings.json"
-ZAI_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
+APPLICATION_ID = "io.github.antonshalin76.CodexBarGnome"
+INDICATOR_ID = "codexbar-gnome-indicator"
 RUNTIMES = ("codex", "grok", "claude")
-RUNTIME_LABELS = {
-    "codex": "Codex",
-    "grok": "Grok",
-    "claude": "Claude",
-}
+RUNTIME_LABELS = {"codex": "Codex", "grok": "Grok", "claude": "Claude"}
+DEFAULT_REFRESH_SECONDS = 300
+MIN_REFRESH_SECONDS = 30
+MAX_REFRESH_SECONDS = 86400
+MAX_LIMIT_ROWS = 8
+MAX_USAGE_EXTRAS = 64
+MAX_DETAILS_CHARS = 16 * 1024
+MAX_CONFIG_BYTES = 64 * 1024
+MAX_DIAGNOSTIC_CHARS = 512
+MAX_DIAGNOSTIC_SCAN_CHARS = 4 * MAX_DIAGNOSTIC_CHARS
 DEFAULT_SETTINGS = {
     "runtimes": {
         "codex": {"poll": True, "autoRefresh": True},
@@ -45,573 +303,2383 @@ DEFAULT_SETTINGS = {
         "claude": {"poll": False, "autoRefresh": False},
     }
 }
+FAIL_CLOSED_SETTINGS = {
+    "runtimes": {runtime: {"poll": False, "autoRefresh": False} for runtime in RUNTIMES}
+}
 
 
-def _normalized_settings(raw: Any) -> dict[str, Any]:
-    settings = json.loads(json.dumps(DEFAULT_SETTINGS))
-    if not isinstance(raw, dict):
-        return settings
-    runtimes = raw.get("runtimes")
-    if not isinstance(runtimes, dict):
-        return settings
-    for runtime in RUNTIMES:
-        runtime_raw = runtimes.get(runtime)
-        if not isinstance(runtime_raw, dict):
-            continue
-        target = settings["runtimes"][runtime]
-        if "poll" in runtime_raw:
-            target["poll"] = bool(runtime_raw["poll"])
-        if "autoRefresh" in runtime_raw:
-            target["autoRefresh"] = bool(runtime_raw["autoRefresh"])
-        if not target["poll"]:
-            target["autoRefresh"] = False
-    return settings
-
-
-def _load_settings() -> dict[str, Any]:
+def _attempt(action: Callable[[], object]) -> Exception | None:
     try:
-        return _normalized_settings(json.loads(CONFIG_PATH.read_text()))
-    except FileNotFoundError:
-        return _normalized_settings(None)
-    except Exception:
-        return _normalized_settings(None)
-
-
-def _save_settings(settings: dict[str, Any]) -> None:
-    normalized = _normalized_settings(settings)
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(normalized, indent=2, sort_keys=True) + "\n")
-
-
-def _enabled_providers(settings: dict[str, Any], *, auto_only: bool) -> list[str]:
-    runtimes = _normalized_settings(settings)["runtimes"]
-    providers: list[str] = []
-    for runtime in RUNTIMES:
-        config = runtimes[runtime]
-        if not config["poll"]:
-            continue
-        if auto_only and not config["autoRefresh"]:
-            continue
-        providers.append(runtime)
-    return providers
-
-
-def _run_codexbar_provider(provider: str) -> tuple[list[dict[str, Any]], str]:
-    cmd = [CODEXBAR, "usage", "--format", "json", "--no-color"]
-    cmd.extend(["--provider", provider])
-    source = "auto" if provider == "grok" and SOURCE == "oauth" else SOURCE
-    if source:
-        cmd.extend(["--source", source])
-    try:
-        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=90, check=False)
-    except Exception as exc:
-        return ([{
-            "provider": provider,
-            "error": {"code": 1, "kind": "runtime", "message": f"{type(exc).__name__}: {exc}"},
-        }], "")
-
-    output = proc.stdout.strip()
-    if proc.returncode != 0 and not output:
-        message = (proc.stderr or f"codexbar exited with {proc.returncode}").strip()
-        return ([{
-            "provider": provider,
-            "error": {"code": proc.returncode, "kind": "provider", "message": message},
-        }], "")
-
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError as exc:
-        err = proc.stderr.strip() if proc.stderr else str(exc)
-        return ([{
-            "provider": provider,
-            "error": {"code": 1, "kind": "parse", "message": err},
-        }], output)
-
-    if not isinstance(payload, list):
-        return ([{
-            "provider": provider,
-            "error": {"code": 1, "kind": "parse", "message": "Unexpected codexbar JSON shape"},
-        }], output)
-    return payload, output
-
-
-def _zai_claude_token() -> str | None:
-    try:
-        settings = json.loads(CLAUDE_SETTINGS_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    environment = settings.get("env") if isinstance(settings, dict) else None
-    if not isinstance(environment, dict):
-        return None
-    base_url = environment.get("ANTHROPIC_BASE_URL")
-    token = environment.get("ANTHROPIC_AUTH_TOKEN")
-    if not isinstance(base_url, str) or not base_url.startswith("https://api.z.ai/"):
-        return None
-    return token if isinstance(token, str) and token else None
-
-
-def _zai_usage_payload(body: Any) -> list[dict[str, Any]]:
-    data = body.get("data") if isinstance(body, dict) else None
-    limits = data.get("limits") if isinstance(data, dict) else None
-    if not isinstance(limits, list):
-        return []
-    windows: list[dict[str, Any]] = []
-    for limit in limits:
-        if not isinstance(limit, dict) or limit.get("type") != "TOKENS_LIMIT":
-            continue
-        percentage = _window_percent({"usedPercent": limit.get("percentage")})
-        reset_at = limit.get("nextResetTime")
-        if percentage is None or not isinstance(reset_at, (int, float)):
-            continue
-        windows.append({
-            "usedPercent": percentage,
-            "resetsAt": datetime.fromtimestamp(reset_at / 1000, timezone.utc).isoformat(),
-        })
-    if not windows:
-        return []
-    usage: dict[str, Any] = {"primary": windows[0]}
-    if len(windows) > 1:
-        usage["secondary"] = windows[1]
-    return [{"provider": "claude", "source": "zai", "usage": usage}]
-
-
-def _run_zai_claude_limits(token: str) -> tuple[list[dict[str, Any]], str]:
-    request = Request(ZAI_QUOTA_URL, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
-    try:
-        with urlopen(request, timeout=20) as response:
-            raw = response.read().decode("utf-8")
-    except (OSError, URLError) as exc:
-        return ([{"provider": "claude", "error": {"code": 1, "kind": "provider", "message": str(exc)}}], "")
-    try:
-        payload = _zai_usage_payload(json.loads(raw))
-    except json.JSONDecodeError as exc:
-        return ([{"provider": "claude", "error": {"code": 1, "kind": "parse", "message": str(exc)}}], raw)
-    if not payload:
-        return ([{"provider": "claude", "error": {"code": 1, "kind": "parse", "message": "Unexpected Z.AI quota JSON shape"}}], raw)
-    return payload, raw
-
-
-def _run_codexbar(providers: list[str]) -> tuple[list[dict[str, Any]] | None, str | None, str]:
-    if not providers:
-        return [], None, "[]"
-
-    combined: list[dict[str, Any]] = []
-    raw_parts: list[str] = []
-    for provider in providers:
-        zai_token = _zai_claude_token() if provider == "claude" else None
-        payload, raw = _run_zai_claude_limits(zai_token) if zai_token else _run_codexbar_provider(provider)
-        combined.extend(payload)
-        if raw:
-            raw_parts.append(raw)
-
-    return combined, None, json.dumps(combined, indent=2) if combined else "\n".join(raw_parts)
-
-
-def _window_percent(window: dict[str, Any] | None) -> int | None:
-    if not isinstance(window, dict):
-        return None
-    value = window.get("usedPercent")
-    if isinstance(value, (int, float)):
-        return max(0, min(999, round(value)))
+        action()
+    except Exception as exc:  # noqa: BLE001 - used only at cleanup boundaries
+        return exc
     return None
 
 
-def _summarize_provider(item: dict[str, Any]) -> tuple[str, str, int | None, bool]:
-    provider = str(item.get("provider") or "?")
-    if isinstance(item.get("error"), dict):
-        msg = str(item["error"].get("message") or "provider error")
-        return provider, f"{provider}: ERROR: {msg}", None, True
-
-    usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
-    windows: list[tuple[str, int | None, str | None]] = [
-        ("session", _window_percent(usage.get("primary")), _reset_text(usage.get("primary"))),
-        ("weekly", _window_percent(usage.get("secondary")), _reset_text(usage.get("secondary"))),
-        ("monthly", _window_percent(usage.get("tertiary")), _reset_text(usage.get("tertiary"))),
-    ]
-    for extra in usage.get("extraRateWindows") or []:
-        if isinstance(extra, dict):
-            title = str(extra.get("title") or extra.get("id") or "extra")
-            window = extra.get("window") if isinstance(extra.get("window"), dict) else {}
-            windows.append((title, _window_percent(window), _reset_text(window)))
-
-    present = [(name, pct, reset) for name, pct, reset in windows if pct is not None]
-    if not present:
-        return provider, f"{provider}: no usage windows", None, False
-
-    headline_name, headline_pct, _ = present[0]
-    max_pct = max(pct for _, pct, _ in present if pct is not None)
-    parts = [f"{name} {pct}%" + (f" reset {reset}" if reset else "") for name, pct, reset in present]
-    account = usage.get("accountEmail") or usage.get("identity", {}).get("accountEmail")
-    prefix = f"{provider}"
-    if account:
-        prefix += f" ({account})"
-    return provider, f"{prefix}: {headline_name} {headline_pct}% | " + " | ".join(parts), max_pct, False
-
-
-def _compact_summary(summary: str) -> str:
-    head = summary.split(" | ", 1)[0]
-    return head.replace(": ERROR:", " ERR:")
-
-
-def _install_dark_menu_css() -> None:
-    screen = Gdk.Screen.get_default()
-    if screen is None:
-        return
-    provider = Gtk.CssProvider()
-    provider.load_from_data(
-        b"""
-        menu {
-          background: #151518;
-          border: 1px solid #2a2a2e;
-          border-radius: 14px;
-          padding: 10px;
-        }
-        menuitem {
-          color: #e8e4dc;
-          background: transparent;
-          border-radius: 8px;
-          padding: 7px 12px;
-          font-family: monospace;
-          font-size: 12px;
-        }
-        menuitem:hover {
-          background: #2a2a2e;
-          color: #ffffff;
-        }
-        menuitem:disabled {
-          color: #e8e4dc;
-        }
-        separator {
-          background: #36363b;
-          min-height: 1px;
-          margin: 8px 0;
-        }
-        """
-    )
-    Gtk.StyleContext.add_provider_for_screen(
-        screen,
-        provider,
-        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
-    )
-
-
-def _panel_label(payload: list[dict[str, Any]], has_error: bool) -> str:
-    by_provider = {
-        str(item.get("provider") or ""): item
-        for item in payload
-        if isinstance(item, dict)
-    }
-
-    def lane(provider: str, window_key: str) -> str:
-        item = by_provider.get(provider) or {}
-        usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
-        percent = _window_percent(usage.get(window_key))
-        return "--" if percent is None else f"{percent}%"
-
-    label = "CxW {codex_weekly}  GkS {grok_session}".format(
-        codex_weekly=lane("codex", "secondary"),
-        grok_session=lane("grok", "primary"),
-    )
-    if "claude" in by_provider:
-        label += "  Cl {session}/{period}".format(
-            session=lane("claude", "primary"),
-            period=lane("claude", "secondary"),
-        )
-    return label + (" !" if has_error else "")
-
-
-def _bar(percent: int | None) -> str:
-    if percent is None:
-        return "░" * BAR_WIDTH
-    filled = max(0, min(BAR_WIDTH, round((percent / 100) * BAR_WIDTH)))
-    if percent > 0 and filled == 0:
-        filled = 1
-    return "█" * filled + "░" * (BAR_WIDTH - filled)
-
-
-def _short_reset(window: Any) -> str:
-    if not isinstance(window, dict):
-        return ""
-    text = _reset_text(window)
-    return f" · resets {text}" if text else ""
-
-
-def _limit_row(label: str, percent: int | None, window: Any) -> dict[str, Any]:
-    percent_text = "--" if percent is None else f"{percent}%"
-    return {
-        "label": label,
-        "percent": percent,
-        "text": f"{_bar(percent)}  {percent_text:>4}  {label}{_short_reset(window)}",
-    }
-
-
-def _collect_limit_rows(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_provider = {
-        str(item.get("provider") or ""): item
-        for item in payload
-        if isinstance(item, dict) and not isinstance(item.get("error"), dict)
-    }
-    rows: list[dict[str, Any]] = []
-
-    codex = by_provider.get("codex") or {}
-    codex_usage = codex.get("usage") if isinstance(codex.get("usage"), dict) else {}
-    codex_week = codex_usage.get("secondary")
-    if isinstance(codex_week, dict):
-        rows.append(_limit_row("Codex Week", _window_percent(codex_week), codex_week))
-
-    grok = by_provider.get("grok") or {}
-    grok_usage = grok.get("usage") if isinstance(grok.get("usage"), dict) else {}
-    grok_session = grok_usage.get("primary")
-    if isinstance(grok_session, dict):
-        rows.append(_limit_row("Grok Session", _window_percent(grok_session), grok_session))
-    grok_week = grok_usage.get("secondary")
-    if isinstance(grok_week, dict):
-        rows.append(_limit_row("Grok Week", _window_percent(grok_week), grok_week))
-
-    claude = by_provider.get("claude") or {}
-    claude_usage = claude.get("usage") if isinstance(claude.get("usage"), dict) else {}
-    claude_zai = claude.get("source") == "zai"
-    claude_session = claude_usage.get("primary")
-    if isinstance(claude_session, dict):
-        rows.append(_limit_row("Claude (Z.AI) 5h" if claude_zai else "Claude Session", _window_percent(claude_session), claude_session))
-    claude_week = claude_usage.get("secondary")
-    if isinstance(claude_week, dict):
-        rows.append(_limit_row("Claude (Z.AI) period" if claude_zai else "Claude Week", _window_percent(claude_week), claude_week))
-
-    for item in payload:
-        provider = str(item.get("provider") or "")
-        usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
-        for extra in usage.get("extraRateWindows") or []:
-            if not isinstance(extra, dict):
-                continue
-            window = extra.get("window") if isinstance(extra.get("window"), dict) else {}
-            percent = _window_percent(window)
-            title = str(extra.get("title") or extra.get("id") or "extra")
-            normalized = title.lower()
-            if percent in (None, 0) and not any(token in normalized for token in ("fable", "opus", "sonnet")):
-                continue
-            display = title.replace(" only", "")
-            if provider == "codex":
-                display = f"Codex {display}"
-            rows.append(_limit_row(display, percent, window))
-
-    return rows[:MAX_LIMIT_ROWS]
-
-
-def _reset_text(window: Any) -> str | None:
-    if not isinstance(window, dict):
-        return None
-    text = window.get("resetDescription")
-    if isinstance(text, str) and text:
-        return text
-    raw = window.get("resetsAt")
-    if not isinstance(raw, str) or not raw:
-        return None
+def sanitize_diagnostic(value: object, sensitive_values: tuple[str, ...] = ()) -> str:
     try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone()
-    except ValueError:
-        return raw
-    return dt.strftime("%b %d %H:%M")
+        text = value if isinstance(value, str) else str(value)
+    except Exception:  # noqa: BLE001 - diagnostics must never become a new failure
+        text = type(value).__name__
 
-
-class CodexBarIndicator:
-    def __init__(self) -> None:
-        self.indicator = AppIndicator.Indicator.new(
-            APP_ID,
-            "utilities-system-monitor",
-            AppIndicator.IndicatorCategory.SYSTEM_SERVICES,
+    def normalize_controls(raw: str) -> str:
+        raw = raw.encode("utf-8", errors="replace").decode("utf-8")
+        controlled = "".join(
+            " " if ord(char) < 32 or ord(char) == 127 else char for char in raw
         )
-        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
-        self.indicator.set_title("CodexBar")
+        return re.sub(r"\s+", " ", controlled).strip()
 
-        _install_dark_menu_css()
-        self.settings = _load_settings()
-        _save_settings(self.settings)
-        self._syncing_settings = False
-        self.menu = Gtk.Menu()
-        self.limit_items: list[Gtk.MenuItem] = []
-        for _ in range(MAX_LIMIT_ROWS):
-            item = Gtk.MenuItem(label="")
-            item.set_sensitive(False)
-            item.hide()
-            self.menu.append(item)
-            self.limit_items.append(item)
+    secrets = tuple(
+        secret for secret in sensitive_values if isinstance(secret, str) and secret
+    )
+    max_secret_length = min(
+        max((len(secret) for secret in secrets), default=0), MAX_CHILD_ENV_BYTES
+    )
+    text = normalize_controls(text[: MAX_DIAGNOSTIC_SCAN_CHARS + max_secret_length])
+    normalized_secrets = sorted(
+        {normalize_controls(secret[:MAX_CHILD_ENV_BYTES]) for secret in secrets} - {""},
+        key=len,
+        reverse=True,
+    )
+    if normalized_secrets:
+        secret_pattern = re.compile(
+            "|".join(re.escape(secret) for secret in normalized_secrets)
+        )
+        text = secret_pattern.sub("[redacted]", text)
+    text = text[:MAX_DIAGNOSTIC_SCAN_CHARS]
+    text = re.sub(
+        r"(?i)authorization\s*:\s*(?:bearer\s+)?[^;,]+",
+        "Authorization: [redacted]",
+        text,
+    )
+    credential_name = (
+        r"[A-Za-z0-9_-]{0,64}(?:api[_-]?key|access[_-]?token|auth[_-]?token|"
+        r"client[_-]?secret|password|passwd|token)"
+    )
+    text = re.sub(
+        rf"(?i)([\"']?\b{credential_name}[\"']?\s*[:=]\s*)"
+        r'(?:"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[^;,]+)',
+        lambda match: match.group(1) + "[redacted]",
+        text,
+    )
+    if len(text) > MAX_DIAGNOSTIC_CHARS:
+        text = text[: MAX_DIAGNOSTIC_CHARS - 3] + "..."
+    return text
 
-        self.limit_separator = Gtk.SeparatorMenuItem()
-        self.limit_separator.hide()
-        self.menu.append(self.limit_separator)
 
-        self.status_item = Gtk.MenuItem(label="CodexBar: starting...")
-        self.status_item.set_sensitive(False)
-        self.menu.append(self.status_item)
+def sanitize_failure_kind(value: object, sensitive_values: tuple[str, ...] = ()) -> str:
+    if not isinstance(value, str):
+        return "provider"
+    kind = sanitize_diagnostic(value, sensitive_values)
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", kind) is None:
+        return "provider"
+    return kind
 
-        self.details_item = Gtk.MenuItem(label="Show details")
-        self.details_item.connect("activate", self.show_details)
-        self.menu.append(self.details_item)
 
-        self.settings_separator = Gtk.SeparatorMenuItem()
-        self.menu.append(self.settings_separator)
-        self.settings_label_item = Gtk.MenuItem(label="Runtime limit polling")
-        self.settings_label_item.set_sensitive(False)
-        self.menu.append(self.settings_label_item)
+_PROCESS_FAILURE_KINDS = frozenset(
+    {
+        "capability",
+        "cancelled",
+        "closed",
+        "config",
+        "configuration",
+        "empty",
+        "encoding",
+        "exit",
+        "io",
+        "output_limit",
+        "parse",
+        "runtime",
+        "schema",
+        "spawn",
+        "timeout",
+    }
+)
 
-        self.setting_items: dict[tuple[str, str], Gtk.CheckMenuItem] = {}
-        for runtime in RUNTIMES:
-            runtime_label = RUNTIME_LABELS[runtime]
-            poll_item = Gtk.CheckMenuItem(label=f"Poll {runtime_label} limits")
-            poll_item.connect("toggled", self.on_setting_toggled, runtime, "poll")
-            self.menu.append(poll_item)
-            self.setting_items[(runtime, "poll")] = poll_item
 
-            auto_item = Gtk.CheckMenuItem(label=f"Auto-refresh {runtime_label}")
-            auto_item.connect("toggled", self.on_setting_toggled, runtime, "autoRefresh")
-            self.menu.append(auto_item)
-            self.setting_items[(runtime, "autoRefresh")] = auto_item
+def _process_failure_kind(value: object, sensitive_values: tuple[str, ...] = ()) -> str:
+    kind = sanitize_failure_kind(value, sensitive_values)
+    return kind if kind in _PROCESS_FAILURE_KINDS else "provider"
 
-        self.menu.append(Gtk.SeparatorMenuItem())
-        self.refresh_item = Gtk.MenuItem(label="Refresh")
-        self.refresh_item.connect("activate", self.refresh_manual)
-        self.menu.append(self.refresh_item)
 
-        self.menu.append(Gtk.SeparatorMenuItem())
-        quit_item = Gtk.MenuItem(label="Quit")
-        quit_item.connect("activate", lambda *_: Gtk.main_quit())
-        self.menu.append(quit_item)
-        self.menu.show_all()
-        self.indicator.set_menu(self.menu)
+def parse_refresh_seconds(
+    raw: str | None, warning_sink: Callable[[str], object]
+) -> int:
+    if raw in (None, ""):
+        return DEFAULT_REFRESH_SECONDS
+    try:
+        value = int(raw, 10)
+        if str(value) != raw or not MIN_REFRESH_SECONDS <= value <= MAX_REFRESH_SECONDS:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        warning = sanitize_diagnostic(
+            f"Invalid refresh interval; using default {DEFAULT_REFRESH_SECONDS}"
+        )
+        _attempt(lambda: warning_sink(warning))
+        return DEFAULT_REFRESH_SECONDS
+    return value
 
-        self.last_raw = ""
-        self.last_summary = "CodexBar: starting..."
-        self.sync_settings_menu()
-        self.refresh_auto()
-        GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh_auto)
 
-    def sync_settings_menu(self) -> None:
-        self._syncing_settings = True
-        normalized = _normalized_settings(self.settings)
-        for runtime in RUNTIMES:
-            runtime_settings = normalized["runtimes"][runtime]
-            poll_item = self.setting_items[(runtime, "poll")]
-            auto_item = self.setting_items[(runtime, "autoRefresh")]
-            poll_item.set_active(bool(runtime_settings["poll"]))
-            auto_item.set_active(bool(runtime_settings["autoRefresh"]))
-            auto_item.set_sensitive(bool(runtime_settings["poll"]))
-        self.refresh_item.set_sensitive(bool(_enabled_providers(self.settings, auto_only=False)))
-        self._syncing_settings = False
+class SettingsFailure(Exception):
+    def __init__(self, message: object) -> None:
+        self.message = sanitize_diagnostic(message)
+        super().__init__(self.message)
 
-    def on_setting_toggled(self, item: Gtk.CheckMenuItem, runtime: str, key: str) -> None:
-        if self._syncing_settings:
-            return
-        self.settings = _normalized_settings(self.settings)
-        runtime_settings = self.settings["runtimes"][runtime]
-        enabled = bool(item.get_active())
-        if key == "poll":
-            runtime_settings["poll"] = enabled
-            if not enabled:
-                runtime_settings["autoRefresh"] = False
-        else:
-            runtime_settings["autoRefresh"] = enabled
-            if enabled:
-                runtime_settings["poll"] = True
-        _save_settings(self.settings)
-        self.sync_settings_menu()
-        if key == "poll" and not enabled:
-            self.remove_runtime_from_current_view(runtime)
-        if key == "autoRefresh" and enabled:
-            self.refresh_auto()
 
-    def remove_runtime_from_current_view(self, runtime: str) -> None:
+class ProcessFailure(Exception):
+    def __init__(self, kind: str, sanitized_message: object) -> None:
+        self.kind = kind
+        self.sanitized_message = sanitize_diagnostic(sanitized_message)
+        super().__init__(self.sanitized_message)
+
+
+@dataclass(frozen=True)
+class SettingsLoad:
+    settings: dict[str, object]
+    failure: SettingsFailure | None = None
+
+
+@dataclass(frozen=True)
+class ProcessRequest:
+    runtime: str
+    argv: tuple[str, ...]
+    env_overrides: dict[str, str | None]
+    timeout: float
+
+
+@dataclass(frozen=True)
+class ProcessResult:
+    exit_code: int
+    stdout: bytes
+    stderr: bytes
+    _redaction_values: tuple[str, ...] = field(default=(), repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class UsageWindow:
+    percent: int
+    window_minutes: int | None = None
+    reset_text: object | None = None
+
+
+@dataclass(frozen=True)
+class UsageExtra:
+    window: UsageWindow
+    slot: str = "extra"
+    provider_title: str | None = None
+
+
+@dataclass(frozen=True)
+class Usage:
+    primary: UsageWindow | None = None
+    secondary: UsageWindow | None = None
+    extras: tuple[UsageExtra, ...] = ()
+
+
+@dataclass(frozen=True)
+class RuntimeResult:
+    runtime: str
+    source: str
+    usage: Usage
+
+
+@dataclass(frozen=True)
+class RuntimeFailure:
+    runtime: str
+    kind: str
+    message: str
+
+
+@dataclass(frozen=True)
+class ProviderReservation:
+    runtime: str
+    token: object
+
+
+@dataclass(frozen=True)
+class RuntimeSnapshot:
+    runtime: str
+    state: str
+    usage: Usage | None = None
+    error: str | None = None
+    refreshing: bool = False
+    source: str | None = None
+
+
+@dataclass(frozen=True)
+class ViewSnapshot:
+    runtimes: tuple[RuntimeSnapshot, ...] = ()
+    global_error: str | None = None
+
+
+def _normalized_settings(raw: object) -> dict[str, object]:
+    if not isinstance(raw, dict):
+        raise SettingsFailure("configuration root must be an object")
+    result = copy.deepcopy(DEFAULT_SETTINGS)
+    if "runtimes" not in raw:
+        return result
+    runtimes = raw["runtimes"]
+    if not isinstance(runtimes, dict):
+        raise SettingsFailure("configuration runtimes must be an object")
+    for runtime in RUNTIMES:
+        if runtime not in runtimes:
+            continue
+        supplied = runtimes[runtime]
+        if not isinstance(supplied, dict):
+            raise SettingsFailure(f"configuration for {runtime} must be an object")
+        target = result["runtimes"][runtime]
+        for key in ("poll", "autoRefresh"):
+            if key in supplied:
+                value = supplied[key]
+                if not isinstance(value, bool):
+                    raise SettingsFailure(f"{runtime}.{key} must be a boolean")
+                target[key] = value
+        if not target["poll"]:
+            target["autoRefresh"] = False
+    return result
+
+
+def _settings_with_toggle(
+    settings: object, runtime: str, key: str, active: bool
+) -> dict[str, object]:
+    if runtime not in RUNTIMES or key not in {"poll", "autoRefresh"}:
+        raise SettingsFailure("unsupported runtime setting")
+    if not isinstance(active, bool):
+        raise SettingsFailure("runtime setting must be a boolean")
+    candidate = _normalized_settings(settings)
+    values = candidate["runtimes"][runtime]
+    values[key] = active
+    if key == "poll" and not active:
+        values["autoRefresh"] = False
+    elif key == "autoRefresh" and active:
+        values["poll"] = True
+    return _normalized_settings(candidate)
+
+
+def _decode_json_object(payload: bytes, description: str) -> dict[str, object]:
+    if len(payload) > MAX_CONFIG_BYTES:
+        raise SettingsFailure(f"{description} exceeds {MAX_CONFIG_BYTES} bytes")
+    try:
+        text = payload.decode("utf-8", errors="strict")
+        value = json.loads(
+            text,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"invalid constant {constant}")
+            ),
+        )
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+        RecursionError,
+    ) as exc:
+        raise SettingsFailure(f"invalid {description}: {type(exc).__name__}") from exc
+    if not isinstance(value, dict):
+        raise SettingsFailure(f"{description} root must be an object")
+    return value
+
+
+def _read_regular_file(path: Path, limit: int, description: str) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"{description} is not a regular file")
+        payload = bytearray()
+        while len(payload) <= limit:
+            chunk = os.read(descriptor, min(64 * 1024, limit + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        return bytes(payload)
+    finally:
+        os.close(descriptor)
+
+
+class SettingsStore:
+    def __init__(
+        self,
+        path: Path,
+        writer: Callable[[str, bytes, object, int], object] | None = None,
+    ) -> None:
+        self.path = Path(path)
+        self._writer = writer or GLib.file_set_contents_full
+        self._lock = threading.RLock()
+        self._write_blocked = False
+
+    def load(self) -> SettingsLoad:
+        with self._lock:
+            try:
+                payload = _read_regular_file(
+                    self.path, MAX_CONFIG_BYTES, "configuration"
+                )
+                raw = _decode_json_object(payload, "configuration")
+                settings = _normalized_settings(raw)
+            except FileNotFoundError:
+                self._write_blocked = False
+                return SettingsLoad(copy.deepcopy(DEFAULT_SETTINGS))
+            except (OSError, SettingsFailure) as exc:
+                self._write_blocked = True
+                failure = (
+                    exc if isinstance(exc, SettingsFailure) else SettingsFailure(exc)
+                )
+                return SettingsLoad(copy.deepcopy(FAIL_CLOSED_SETTINGS), failure)
+            self._write_blocked = False
+            return SettingsLoad(settings)
+
+    def save(self, settings: dict[str, object]) -> None:
         try:
-            payload = json.loads(self.last_raw)
-        except Exception:
-            return
-        if not isinstance(payload, list):
-            return
-        filtered = [item for item in payload if item.get("provider") != runtime]
-        self._apply_refresh(filtered, None, json.dumps(filtered, indent=2))
+            normalized = _normalized_settings(settings)
+            contents = (
+                json.dumps(normalized, indent=2, sort_keys=True) + "\n"
+            ).encode()
+            with self._lock:
+                if self._write_blocked:
+                    raise SettingsFailure(
+                        "configuration load failed; restart before changing settings"
+                    )
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                written = self._writer(
+                    str(self.path),
+                    contents,
+                    GLib.FileSetContentsFlags.CONSISTENT
+                    | GLib.FileSetContentsFlags.DURABLE,
+                    0o600,
+                )
+                if written is False:
+                    raise OSError("atomic settings writer reported failure")
+        except SettingsFailure:
+            raise
+        except Exception as exc:
+            raise SettingsFailure(exc) from exc
 
-    def _set_limit_rows(self, rows: list[dict[str, Any]]) -> None:
-        for item, row in zip(self.limit_items, rows):
-            item.set_label(str(row["text"]))
-            item.show()
-        for item in self.limit_items[len(rows):]:
-            item.hide()
-        if rows:
-            self.limit_separator.show()
-            self.status_item.hide()
-        else:
-            self.limit_separator.hide()
-            self.status_item.show()
 
-    def refresh_auto(self, *_: object) -> bool:
-        return self.refresh(auto_only=True)
+@dataclass
+class _InvocationHandle:
+    runtime: str
+    process: subprocess.Popen[bytes] | None = None
+    reason: str | None = None
+    ready: threading.Event = field(default_factory=threading.Event)
+    spawning: bool = False
 
-    def refresh_manual(self, *_: object) -> bool:
-        return self.refresh(auto_only=False)
 
-    def refresh(self, *, auto_only: bool) -> bool:
-        providers = _enabled_providers(self.settings, auto_only=auto_only)
-        if not providers:
-            self._apply_refresh([], None, "[]")
-            mode = "Auto-refresh" if auto_only else "Polling"
-            self.status_item.show()
-            self.status_item.set_label(f"{mode} disabled")
-            self.indicator.set_label("CB off", "CB off")
-            return True
-        if not self.last_raw:
-            self.status_item.set_label("CodexBar: refreshing...")
-        threading.Thread(target=self._refresh_worker, args=(providers,), daemon=True).start()
-        return True
+@dataclass(eq=False)
+class _ProviderRequest:
+    runtime: str
+    handle: _InvocationHandle
+    token: object
+    cancelled: bool = False
 
-    def _refresh_worker(self, providers: list[str]) -> None:
-        payload, error, raw = _run_codexbar(providers)
-        GLib.idle_add(self._apply_refresh, payload, error, raw)
 
-    def _apply_refresh(self, payload: list[dict[str, Any]] | None, error: str | None, raw: str) -> bool:
-        if error:
-            self.last_summary = f"CodexBar: ERROR: {error}"
-            self.indicator.set_label("CB !", "CB 100%")
-            self._set_limit_rows([])
-            self.status_item.show()
-            self.status_item.set_label(self.last_summary[:180])
-            if raw:
-                self.last_raw = raw
+class ProcessExecutor:
+    def __init__(
+        self,
+        executable: Path | str | None = None,
+        supervisor_path: Path | str | None = None,
+        stdout_cap: int = 1024 * 1024,
+        stderr_cap: int = 64 * 1024,
+        read_chunk: int = 64 * 1024,
+    ) -> None:
+        self._executable = Path(executable) if executable is not None else None
+        self._supervisor_path = Path(supervisor_path or __file__)
+        self._stdout_cap = max(1, int(stdout_cap))
+        self._stderr_cap = max(1, int(stderr_cap))
+        self._read_chunk = max(1, int(read_chunk))
+        self._lock = threading.RLock()
+        self._active: dict[str, _InvocationHandle] = {}
+        self._pending: dict[str, list[_InvocationHandle]] = {}
+        self._closed = False
+
+    @staticmethod
+    def _is_usable(path: Path) -> bool:
+        try:
+            mode = path.stat().st_mode
+        except OSError:
             return False
+        return stat.S_ISREG(mode) and os.access(path, os.X_OK)
 
-        assert payload is not None
-        summaries: list[str] = []
-        has_error = False
-        for item in payload:
-            _, summary, _, item_error = _summarize_provider(item)
-            summaries.append(summary)
-            has_error = has_error or item_error
+    @staticmethod
+    def resolve_executable(
+        env: dict[str, str] | os._Environ[str] = os.environ,
+        home: Path | None = None,
+        which: Callable[[str], str | None] = shutil.which,
+    ) -> Path:
+        if "CODEXBAR_BIN" in env:
+            explicit = Path(env["CODEXBAR_BIN"])
+            if ProcessExecutor._is_usable(explicit):
+                return explicit
+            raise ProcessFailure(
+                "configuration", "CODEXBAR_BIN does not name an executable file"
+            )
+        local = Path(home or Path.home()) / ".local" / "bin" / "codexbar"
+        if ProcessExecutor._is_usable(local):
+            return local
+        discovered = which("codexbar")
+        if discovered and ProcessExecutor._is_usable(Path(discovered)):
+            return Path(discovered)
+        raise ProcessFailure(
+            "configuration",
+            "codexbar executable not found; install CodexBar or set CODEXBAR_BIN",
+        )
 
-        label = _panel_label(payload, has_error)
-        limit_rows = _collect_limit_rows(payload)
+    @property
+    def executable(self) -> Path:
+        with self._lock:
+            if self._executable is None:
+                self._executable = self.resolve_executable()
+            elif not self._is_usable(self._executable):
+                raise ProcessFailure("configuration", "codexbar executable is unusable")
+            return self._executable
 
-        self.last_raw = raw
-        self.last_summary = "\n".join(summaries) if summaries else "CodexBar: no providers returned"
-        self.indicator.set_label(label, "CxW 100%  GkS 100%")
-        self._set_limit_rows(limit_rows)
-        self.status_item.set_label("; ".join(_compact_summary(s) for s in summaries)[:180])
+    @staticmethod
+    def _send_stop(active: _InvocationHandle, signum: int = signal.SIGTERM) -> None:
+        process = active.process
+        if process is not None and process.poll() is None:
+            if signum == signal.SIGKILL:
+                for pid in reversed(_descendant_pids(process.pid)):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+            _signal_process_group(process.pid, signum)
+
+    def reserve(self, runtime: str) -> _InvocationHandle:
+        if not isinstance(runtime, str) or not runtime:
+            raise ProcessFailure("configuration", "provider runtime is invalid")
+        with self._lock:
+            if self._closed:
+                raise ProcessFailure("closed", "provider executor is closed")
+            handle = _InvocationHandle(runtime)
+            if runtime in self._active:
+                self._pending.setdefault(runtime, []).append(handle)
+            else:
+                self._active[runtime] = handle
+                handle.ready.set()
+            return handle
+
+    def _remove_handle_locked(self, handle: _InvocationHandle) -> None:
+        runtime = handle.runtime
+        if self._active.get(runtime) is handle:
+            self._active.pop(runtime, None)
+            queue = self._pending.get(runtime, [])
+            while queue:
+                next_handle = queue.pop(0)
+                if next_handle.reason is not None:
+                    next_handle.ready.set()
+                    continue
+                self._active[runtime] = next_handle
+                next_handle.ready.set()
+                break
+            if not queue:
+                self._pending.pop(runtime, None)
+            return
+        queue = self._pending.get(runtime)
+        if queue is None:
+            return
+        try:
+            queue.remove(handle)
+        except ValueError:
+            return
+        if not queue:
+            self._pending.pop(runtime, None)
+
+    def release(self, handle: _InvocationHandle) -> None:
+        with self._lock:
+            if handle.process is None:
+                if handle.reason is None:
+                    handle.reason = "cancelled"
+                if not handle.spawning:
+                    self._remove_handle_locked(handle)
+                    handle.ready.set()
+
+    def cancel(self, runtime: str) -> None:
+        active_to_stop: _InvocationHandle | None = None
+        with self._lock:
+            active = self._active.get(runtime)
+            if active is not None:
+                if active.reason is None:
+                    active.reason = "cancelled"
+                if active.process is not None:
+                    active_to_stop = active
+                elif not active.spawning:
+                    self._active.pop(runtime, None)
+                    active.ready.set()
+            for pending in self._pending.pop(runtime, []):
+                if pending.reason is None:
+                    pending.reason = "cancelled"
+                pending.ready.set()
+        if active_to_stop is not None:
+            self._send_stop(active_to_stop)
+
+    def close(self) -> None:
+        active_to_stop: list[_InvocationHandle] = []
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for queue in self._pending.values():
+                for item in queue:
+                    if item.reason is None:
+                        item.reason = "cancelled"
+                    item.ready.set()
+            self._pending.clear()
+            for item in tuple(self._active.values()):
+                if item.reason is None:
+                    item.reason = "cancelled"
+                if item.process is not None:
+                    active_to_stop.append(item)
+                elif not item.spawning:
+                    self._active.pop(item.runtime, None)
+                    item.ready.set()
+        for item in active_to_stop:
+            self._send_stop(item)
+
+    def run(
+        self,
+        request: ProcessRequest,
+        reservation: _InvocationHandle | None = None,
+    ) -> ProcessResult:
+        if not request.argv or any(not isinstance(arg, str) for arg in request.argv):
+            raise ProcessFailure("configuration", "provider command is invalid")
+        try:
+            timeout = float(request.timeout)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ProcessFailure(
+                "configuration", "provider timeout is invalid"
+            ) from exc
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ProcessFailure("configuration", "provider timeout is invalid")
+        if not isinstance(request.env_overrides, dict):
+            raise ProcessFailure("configuration", "provider environment is invalid")
+        child_environment = dict(os.environ)
+        override_sensitive_values = tuple(
+            value
+            for value in request.env_overrides.values()
+            if isinstance(value, str) and value
+        )
+        for key, value in tuple(child_environment.items()):
+            if _CREDENTIAL_ENV_KEY.search(key) and any(
+                secret in value for secret in override_sensitive_values
+            ):
+                child_environment.pop(key, None)
+        for key, value in request.env_overrides.items():
+            if (
+                not isinstance(key, str)
+                or not key
+                or "=" in key
+                or "\x00" in key
+                or not _os_text_encodable(key)
+                or (value is not None and not isinstance(value, str))
+                or (
+                    isinstance(value, str)
+                    and ("\x00" in value or not _os_text_encodable(value))
+                )
+            ):
+                raise ProcessFailure("configuration", "provider environment is invalid")
+            if value is None:
+                child_environment.pop(key, None)
+            else:
+                child_environment[key] = value
+        sensitive_values = _credential_values(child_environment)
+        try:
+            environment_payload = json.dumps(
+                child_environment,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8", errors="strict")
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise ProcessFailure(
+                "configuration", "provider environment is invalid"
+            ) from exc
+        if len(environment_payload) > MAX_CHILD_ENV_BYTES:
+            raise ProcessFailure(
+                "configuration", "provider environment exceeds the safety limit"
+            )
+        active = reservation or self.reserve(request.runtime)
+        if active.runtime != request.runtime:
+            self.release(active)
+            raise ProcessFailure("configuration", "provider reservation mismatch")
+        while not active.ready.wait(0.05):
+            with self._lock:
+                if active.reason is not None:
+                    break
+        with self._lock:
+            if self._closed:
+                self.release(active)
+                raise ProcessFailure("closed", "provider executor is closed")
+            if self._active.get(request.runtime) is not active:
+                raise ProcessFailure("cancelled", "provider command was cancelled")
+            if active.reason is not None:
+                self.release(active)
+                raise ProcessFailure(
+                    active.reason,
+                    "provider command was cancelled",
+                )
+            if active.spawning or active.process is not None:
+                raise ProcessFailure(
+                    "configuration", "provider reservation was already consumed"
+                )
+            active.spawning = True
+        environment_fd = -1
+        try:
+            environment_fd = os.memfd_create(
+                "codexbar-provider-environment", os.MFD_CLOEXEC
+            )
+            payload_view = memoryview(environment_payload)
+            while payload_view:
+                written = os.write(environment_fd, payload_view)
+                if written <= 0:
+                    raise OSError("provider environment handoff stopped")
+                payload_view = payload_view[written:]
+            os.lseek(environment_fd, 0, os.SEEK_SET)
+            command = (
+                sys.executable,
+                str(self._supervisor_path),
+                "--child-supervisor-env-fd",
+                str(environment_fd),
+                "--expected-parent-pid",
+                str(os.getpid()),
+                "--",
+                *request.argv,
+            )
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"PATH": os.defpath},
+                start_new_session=True,
+                close_fds=True,
+                pass_fds=(environment_fd,),
+            )
+        except Exception as exc:
+            with self._lock:
+                active.spawning = False
+                self._remove_handle_locked(active)
+            raise ProcessFailure(
+                "spawn", f"provider spawn failed: {type(exc).__name__}"
+            ) from exc
+        finally:
+            if environment_fd >= 0:
+                _attempt(lambda: os.close(environment_fd))
+        with self._lock:
+            active.spawning = False
+            active.process = process
+            stop_after_spawn = self._closed or active.reason is not None
+        if stop_after_spawn:
+            self._send_stop(active)
+
+        stdout = bytearray()
+        stderr = bytearray()
+        selector: selectors.BaseSelector | None = None
+        exit_code: int | None = None
+        try:
+            selector = selectors.DefaultSelector()
+            if process.stdout is None or process.stderr is None:
+                raise ProcessFailure("spawn", "provider pipes were not created")
+            for stream, label in (
+                (process.stdout, "stdout"),
+                (process.stderr, "stderr"),
+            ):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, label)
+            deadline = time.monotonic() + timeout
+            stop_deadline: float | None = None
+            while selector.get_map() or process.poll() is None:
+                with self._lock:
+                    reason = active.reason
+                now = time.monotonic()
+                if reason is None and now >= deadline:
+                    with self._lock:
+                        if active.reason is None:
+                            active.reason = "timeout"
+                        reason = active.reason
+                if reason is not None:
+                    self._send_stop(active)
+                    if stop_deadline is None:
+                        stop_deadline = now + 2.0
+                    elif now >= stop_deadline:
+                        self._send_stop(active, signal.SIGKILL)
+                        break
+                for key, _mask in selector.select(0.05):
+                    try:
+                        chunk = os.read(key.fd, self._read_chunk)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    target = stdout if key.data == "stdout" else stderr
+                    cap = self._stdout_cap if key.data == "stdout" else self._stderr_cap
+                    remaining = max(0, cap - len(target))
+                    target.extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        with self._lock:
+                            if active.reason is None:
+                                active.reason = "output_limit"
+                        self._send_stop(active)
+                if process.poll() is not None and not selector.get_map():
+                    break
+            try:
+                exit_code = process.wait(timeout=1.5)
+            except subprocess.TimeoutExpired:
+                self._send_stop(active, signal.SIGKILL)
+                try:
+                    exit_code = process.wait(timeout=2)
+                except subprocess.TimeoutExpired as exc:
+                    raise ProcessFailure(
+                        "timeout", "provider process could not be terminated"
+                    ) from exc
+        except ProcessFailure:
+            raise
+        except (OSError, ValueError) as exc:
+            raise ProcessFailure(
+                "io", f"provider I/O failed: {type(exc).__name__}"
+            ) from exc
+        finally:
+            if process.poll() is None:
+                self._send_stop(active)
+                try:
+                    process.wait(timeout=0.75)
+                except subprocess.TimeoutExpired:
+                    self._send_stop(active, signal.SIGKILL)
+                    try:
+                        process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+            if selector is not None:
+                _attempt(selector.close)
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    _attempt(stream.close)
+            with self._lock:
+                self._remove_handle_locked(active)
+
+        with self._lock:
+            reason = active.reason
+        if reason is not None:
+            messages = {
+                "timeout": "provider command timed out",
+                "output_limit": "provider output exceeded the safety limit",
+                "cancelled": "provider command was cancelled",
+            }
+            raise ProcessFailure(reason, messages.get(reason, reason))
+        if exit_code is None:
+            raise ProcessFailure("runtime", "provider exit status is unavailable")
+        if exit_code != 0:
+            diagnostic = stderr.decode("utf-8", errors="replace").strip()
+            raise ProcessFailure(
+                "exit",
+                sanitize_diagnostic(diagnostic, sensitive_values)
+                or f"codexbar exited with {exit_code}",
+            )
+        if not stdout:
+            raise ProcessFailure("empty", "provider returned empty output")
+        try:
+            stdout.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ProcessFailure("encoding", "provider returned invalid UTF-8") from exc
+        return ProcessResult(
+            exit_code,
+            bytes(stdout),
+            bytes(stderr),
+            sensitive_values,
+        )
+
+
+def _json_payload(payload: bytes) -> object:
+    try:
+        text = payload.decode("utf-8", errors="strict")
+        return json.loads(
+            text,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"invalid constant {constant}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ProcessFailure(
+            "parse", f"invalid provider JSON: {type(exc).__name__}"
+        ) from exc
+
+
+def _normalized_percent(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProcessFailure("schema", "usedPercent must be a finite number")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ProcessFailure("schema", "usedPercent must be a finite number")
+    if value <= 0:
+        return 0
+    if value >= 100:
+        return 100
+    if isinstance(value, int):
+        return value
+    try:
+        rounded = int(Decimal(str(value)).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError) as exc:
+        raise ProcessFailure("schema", "usedPercent is invalid") from exc
+    return max(0, min(100, rounded))
+
+
+def _parse_window(raw: object, sensitive_values: tuple[str, ...] = ()) -> UsageWindow:
+    if not isinstance(raw, dict):
+        raise ProcessFailure("schema", "usage window must be an object")
+    if "usedPercent" not in raw:
+        raise ProcessFailure("schema", "usage window is missing usedPercent")
+    percent = _normalized_percent(raw["usedPercent"])
+    minutes = raw.get("windowMinutes")
+    if "windowMinutes" in raw and (
+        isinstance(minutes, bool) or not isinstance(minutes, int)
+    ):
+        raise ProcessFailure("schema", "windowMinutes must be an integer")
+    reset_description = raw.get("resetDescription")
+    if "resetDescription" in raw and not isinstance(reset_description, str):
+        raise ProcessFailure("schema", "resetDescription must be a string")
+    resets_at = raw.get("resetsAt")
+    if "resetsAt" in raw and not isinstance(resets_at, str):
+        raise ProcessFailure("schema", "resetsAt must be an ISO-8601 timestamp")
+    parsed_reset: str | None = None
+    if "resetsAt" in raw:
+        if not resets_at or len(resets_at) > 128:
+            raise ProcessFailure("schema", "resetsAt must be an ISO-8601 timestamp")
+        candidate = resets_at[:-1] + "+00:00" if resets_at.endswith("Z") else resets_at
+        try:
+            parsed_reset_at = datetime.fromisoformat(candidate)
+        except ValueError as exc:
+            raise ProcessFailure(
+                "schema", "resetsAt must be an ISO-8601 timestamp"
+            ) from exc
+        if parsed_reset_at.tzinfo is None:
+            raise ProcessFailure("schema", "resetsAt must include a timezone")
+        parsed_reset = sanitize_diagnostic(resets_at, sensitive_values)
+    if isinstance(reset_description, str) and reset_description:
+        reset = sanitize_diagnostic(reset_description, sensitive_values)
+    else:
+        reset = parsed_reset
+    return UsageWindow(percent, minutes, reset)
+
+
+def _is_zai_origin(value: object) -> bool:
+    if not isinstance(value, str) or value != value.strip() or re.search(r"\s", value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() == "https"
+        and parsed.hostname is not None
+        and parsed.hostname.lower() == "api.z.ai"
+        and parsed.username is None
+        and parsed.password is None
+        and port in (None, 443)
+    )
+
+
+class ProviderGateway:
+    def __init__(
+        self,
+        executor: ProcessExecutor,
+        claude_settings_path: Path,
+        source: str = "",
+        timeout: float = 90,
+    ) -> None:
+        self._executor = executor
+        self._claude_settings_path = Path(claude_settings_path)
+        self._source = source if isinstance(source, str) else ""
+        self._timeout = timeout
+        self._capability_lock = threading.Lock()
+        self._capability_state_lock = threading.Lock()
+        self._capability_waiters: dict[object, _ProviderRequest] = {}
+        self._capability_owner: tuple[str, object] | None = None
+        self._capability_identity: tuple[object, ...] | None = None
+        self._capability_failure: tuple[str, str] | None = None
+        self._request_lock = threading.RLock()
+        self._reservations: dict[ProviderReservation, _ProviderRequest] = {}
+        self._active_requests: dict[object, _ProviderRequest] = {}
+        self._closed = False
+
+    def _claude_route(self) -> tuple[str, str | None]:
+        try:
+            payload = _read_regular_file(
+                self._claude_settings_path, MAX_CONFIG_BYTES, "Claude settings"
+            )
+        except FileNotFoundError:
+            return "claude", None
+        except OSError as exc:
+            raise ProcessFailure(
+                "config", f"invalid Claude settings: {type(exc).__name__}"
+            ) from exc
+        try:
+            settings = _decode_json_object(payload, "Claude settings")
+        except SettingsFailure as exc:
+            raise ProcessFailure("config", exc.message) from exc
+        environment = settings.get("env", {})
+        if not isinstance(environment, dict):
+            raise ProcessFailure("config", "Claude settings env must be an object")
+        if not _is_zai_origin(environment.get("ANTHROPIC_BASE_URL")):
+            return "claude", None
+        token = environment.get("ANTHROPIC_AUTH_TOKEN")
+        if not isinstance(token, str) or not token.strip():
+            raise ProcessFailure("config", "Z.AI token is missing from Claude settings")
+        token = token.strip()
+        if "\x00" in token or not _os_text_encodable(token):
+            raise ProcessFailure("config", "Z.AI token contains an invalid character")
+        return "zai", token
+
+    def _check_request(self, request: _ProviderRequest) -> None:
+        with self._request_lock:
+            if (
+                request.cancelled
+                or self._active_requests.get(request.token) is not request
+            ):
+                raise ProcessFailure("cancelled", "provider command was cancelled")
+
+    def _ensure_capability(self, request: _ProviderRequest) -> None:
+        runtime = request.runtime
+        self._check_request(request)
+        executable = self._executor.executable
+        try:
+            metadata = executable.stat()
+        except OSError as exc:
+            raise ProcessFailure(
+                "configuration", "codexbar executable metadata is unavailable"
+            ) from exc
+        identity = (
+            str(executable),
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_mode,
+        )
+        waiter = object()
+        with self._request_lock:
+            if (
+                request.cancelled
+                or self._active_requests.get(request.token) is not request
+            ):
+                raise ProcessFailure("cancelled", "provider command was cancelled")
+            with self._capability_state_lock:
+                self._capability_waiters[waiter] = request
+        try:
+            with self._capability_lock:
+                with self._capability_state_lock:
+                    if waiter not in self._capability_waiters:
+                        raise ProcessFailure(
+                            "cancelled", "provider command was cancelled"
+                        )
+                if self._capability_identity == identity:
+                    if self._capability_failure is not None:
+                        raise ProcessFailure(*self._capability_failure)
+                    return
+                self._capability_failure = None
+                capability_runtime = f"capability:{runtime}"
+                capability_handle: _InvocationHandle | object | None = None
+                try:
+                    capability_handle = self._executor.reserve(capability_runtime)
+                    with self._capability_state_lock:
+                        if waiter not in self._capability_waiters:
+                            raise ProcessFailure(
+                                "cancelled", "provider command was cancelled"
+                            )
+                        self._capability_owner = (runtime, waiter)
+                    result = self._executor.run(
+                        ProcessRequest(
+                            runtime=capability_runtime,
+                            argv=(str(self._executor.executable), "usage", "--help"),
+                            env_overrides={"Z_AI_API_KEY": None},
+                            timeout=min(15.0, self._timeout),
+                        ),
+                        capability_handle,
+                    )
+                    help_text = result.stdout.decode("utf-8", errors="strict")
+                    help_delimiter = r"[\s,\[\](){}|]"
+                    providers_present = all(
+                        re.search(
+                            rf"(?:^|{help_delimiter}){re.escape(provider)}"
+                            rf"(?=$|{help_delimiter})",
+                            help_text,
+                        )
+                        for provider in RUNTIMES + ("zai",)
+                    )
+                    json_only_present = re.search(
+                        rf"(?:^|{help_delimiter})--json-only"
+                        rf"(?=$|{help_delimiter})",
+                        help_text,
+                    )
+                    if json_only_present is None or not providers_present:
+                        raise ProcessFailure(
+                            "capability",
+                            "installed CodexBar lacks required JSON provider support",
+                        )
+                except ProcessFailure as exc:
+                    if exc.kind == "cancelled":
+                        raise
+                    self._capability_failure = (exc.kind, exc.sanitized_message)
+                finally:
+                    if capability_handle is not None:
+                        self._executor.release(capability_handle)
+                    with self._capability_state_lock:
+                        if self._capability_owner == (runtime, waiter):
+                            self._capability_owner = None
+                self._capability_identity = identity
+                with self._capability_state_lock:
+                    if waiter not in self._capability_waiters:
+                        raise ProcessFailure(
+                            "cancelled", "provider command was cancelled"
+                        )
+                if self._capability_failure is not None:
+                    raise ProcessFailure(*self._capability_failure)
+        finally:
+            with self._capability_state_lock:
+                self._capability_waiters.pop(waiter, None)
+
+    @staticmethod
+    def _regular_usage(
+        usage_raw: dict[str, object], sensitive_values: tuple[str, ...] = ()
+    ) -> Usage:
+        primary = (
+            _parse_window(usage_raw["primary"], sensitive_values)
+            if "primary" in usage_raw
+            else None
+        )
+        secondary = (
+            _parse_window(usage_raw["secondary"], sensitive_values)
+            if "secondary" in usage_raw
+            else None
+        )
+        extras: list[UsageExtra] = []
+        if "tertiary" in usage_raw:
+            extras.append(
+                UsageExtra(
+                    _parse_window(usage_raw["tertiary"], sensitive_values),
+                    slot="tertiary",
+                )
+            )
+        raw_extras = usage_raw.get("extraRateWindows", [])
+        if not isinstance(raw_extras, list):
+            raise ProcessFailure("schema", "extraRateWindows must be an array")
+        for raw_extra in raw_extras:
+            if not isinstance(raw_extra, dict):
+                raise ProcessFailure("schema", "extra rate window must be an object")
+            if "window" not in raw_extra:
+                raise ProcessFailure("schema", "extra rate window is missing window")
+            for title_key in ("title", "id"):
+                if title_key in raw_extra and not isinstance(raw_extra[title_key], str):
+                    raise ProcessFailure(
+                        "schema", f"extra rate window {title_key} must be a string"
+                    )
+            raw_title = raw_extra.get("title") or raw_extra.get("id")
+            provider_title = (
+                sanitize_diagnostic(raw_title, sensitive_values)[:128]
+                if isinstance(raw_title, str) and raw_title
+                else None
+            )
+            parsed_extra = UsageExtra(
+                _parse_window(raw_extra["window"], sensitive_values),
+                provider_title=provider_title,
+            )
+            if len(extras) < MAX_USAGE_EXTRAS:
+                extras.append(parsed_extra)
+        return Usage(primary, secondary, tuple(extras))
+
+    @staticmethod
+    def _zai_usage(
+        usage_raw: dict[str, object], sensitive_values: tuple[str, ...] = ()
+    ) -> Usage:
+        candidates: list[UsageWindow] = []
+        for key in ("primary", "secondary", "tertiary"):
+            if key not in usage_raw:
+                continue
+            raw = usage_raw[key]
+            if not isinstance(raw, dict):
+                raise ProcessFailure("schema", "Z.AI usage window must be an object")
+            if "windowMinutes" not in raw:
+                continue
+            minutes = raw.get("windowMinutes")
+            if isinstance(minutes, bool) or not isinstance(minutes, int):
+                raise ProcessFailure("schema", "windowMinutes must be an integer")
+            if minutes not in (300, 10080):
+                continue
+            candidates.append(_parse_window(raw, sensitive_values))
+        raw_extras = usage_raw.get("extraRateWindows", [])
+        if not isinstance(raw_extras, list):
+            raise ProcessFailure("schema", "extraRateWindows must be an array")
+        for raw_extra in raw_extras:
+            if not isinstance(raw_extra, dict):
+                raise ProcessFailure("schema", "extra rate window must be an object")
+            raw = raw_extra.get("window")
+            if not isinstance(raw, dict):
+                raise ProcessFailure("schema", "extra rate window is missing window")
+            if "windowMinutes" not in raw:
+                continue
+            minutes = raw.get("windowMinutes")
+            if isinstance(minutes, bool) or not isinstance(minutes, int):
+                raise ProcessFailure("schema", "windowMinutes must be an integer")
+            if minutes in (300, 10080):
+                candidates.append(_parse_window(raw, sensitive_values))
+        horizons: dict[int, UsageWindow] = {}
+        for window in candidates:
+            assert window.window_minutes is not None
+            existing = horizons.get(window.window_minutes)
+            if existing is not None and existing != window:
+                raise ProcessFailure(
+                    "schema", "conflicting Z.AI windows for one horizon"
+                )
+            horizons[window.window_minutes] = window
+        return Usage(horizons.get(300), horizons.get(10080), ())
+
+    def reserve(self, runtime: str) -> ProviderReservation:
+        if runtime not in RUNTIMES:
+            raise ProcessFailure("configuration", "unsupported runtime")
+        with self._request_lock:
+            if self._closed:
+                raise ProcessFailure("closed", "provider gateway is closed")
+            handle = self._executor.reserve(runtime)
+            token = object()
+            reservation = ProviderReservation(runtime, token)
+            self._reservations[reservation] = _ProviderRequest(runtime, handle, token)
+        return reservation
+
+    def _claim(self, reservation: ProviderReservation) -> _ProviderRequest:
+        with self._request_lock:
+            request = self._reservations.pop(reservation, None)
+            if request is not None and not request.cancelled:
+                self._active_requests[request.token] = request
+        if request is None or request.cancelled:
+            raise ProcessFailure("cancelled", "provider command was cancelled")
+        return request
+
+    def _discard_reservation(self, reservation: ProviderReservation) -> None:
+        with self._request_lock:
+            request = self._reservations.pop(reservation, None)
+            if request is not None:
+                request.cancelled = True
+        if request is not None:
+            self._executor.release(request.handle)
+
+    def release(self, reservation: object) -> None:
+        if isinstance(reservation, ProviderReservation):
+            self._discard_reservation(reservation)
+
+    def fetch(
+        self,
+        runtime: str,
+        reservation: ProviderReservation | None = None,
+    ) -> RuntimeResult | RuntimeFailure:
+        if runtime not in RUNTIMES:
+            return RuntimeFailure(runtime, "configuration", "unsupported runtime")
+        try:
+            prepared = reservation or self.reserve(runtime)
+            if not isinstance(prepared, ProviderReservation):
+                raise ProcessFailure("configuration", "provider reservation is invalid")
+            if prepared.runtime != runtime:
+                self._discard_reservation(prepared)
+                raise ProcessFailure("configuration", "provider reservation mismatch")
+            request = self._claim(prepared)
+        except ProcessFailure as exc:
+            return RuntimeFailure(
+                runtime, _process_failure_kind(exc.kind), exc.sanitized_message
+            )
+        except Exception as exc:  # noqa: BLE001 - reservation boundary is fail-closed
+            return RuntimeFailure(
+                runtime, "runtime", sanitize_diagnostic(type(exc).__name__)
+            )
+        token: str | None = None
+        sensitive_values = _credential_values(dict(os.environ))
+        physical = runtime
+        try:
+            if runtime == "claude":
+                physical, token = self._claude_route()
+                if token:
+                    sensitive_values = tuple(dict.fromkeys((*sensitive_values, token)))
+            self._check_request(request)
+            self._ensure_capability(request)
+            self._check_request(request)
+            source_args: tuple[str, ...] = ()
+            if physical != "zai" and self._source:
+                selected = (
+                    "auto"
+                    if runtime == "grok" and self._source == "oauth"
+                    else self._source
+                )
+                source_args = ("--source", selected)
+            result = self._executor.run(
+                ProcessRequest(
+                    runtime=runtime,
+                    argv=(
+                        str(self._executor.executable),
+                        "usage",
+                        "--provider",
+                        physical,
+                        "--json-only",
+                        "--no-color",
+                        *source_args,
+                    ),
+                    env_overrides={"Z_AI_API_KEY": token},
+                    timeout=self._timeout,
+                ),
+                request.handle,
+            )
+            sensitive_values = tuple(
+                dict.fromkeys((*sensitive_values, *result._redaction_values))
+            )
+            payload = _json_payload(result.stdout)
+            if not isinstance(payload, list) or len(payload) != 1:
+                raise ProcessFailure(
+                    "schema", "provider JSON must contain exactly one item"
+                )
+            item = payload[0]
+            if not isinstance(item, dict) or item.get("provider") != physical:
+                raise ProcessFailure("schema", "provider JSON identity mismatch")
+            if "error" in item:
+                error = item["error"]
+                if not isinstance(error, dict) or not isinstance(
+                    error.get("message"), str
+                ):
+                    raise ProcessFailure("schema", "provider error has invalid shape")
+                kind = sanitize_failure_kind(error.get("kind"), sensitive_values)
+                return RuntimeFailure(
+                    runtime,
+                    kind,
+                    sanitize_diagnostic(error["message"], sensitive_values),
+                )
+            usage_raw = item.get("usage", {})
+            if not isinstance(usage_raw, dict):
+                raise ProcessFailure("schema", "provider usage must be an object")
+            usage = (
+                self._zai_usage(usage_raw, sensitive_values)
+                if physical == "zai"
+                else self._regular_usage(usage_raw, sensitive_values)
+            )
+            source = "zai" if physical == "zai" else runtime
+            return RuntimeResult(runtime, source, usage)
+        except ProcessFailure as exc:
+            return RuntimeFailure(
+                runtime,
+                _process_failure_kind(exc.kind, sensitive_values),
+                sanitize_diagnostic(exc.sanitized_message, sensitive_values),
+            )
+        except Exception as exc:  # noqa: BLE001 - provider boundary is fail-closed
+            return RuntimeFailure(
+                runtime, "runtime", sanitize_diagnostic(type(exc).__name__)
+            )
+        finally:
+            self._executor.release(request.handle)
+            with self._request_lock:
+                if self._active_requests.get(request.token) is request:
+                    self._active_requests.pop(request.token, None)
+
+    def cancel(self, runtime: str) -> None:
+        pending: list[_ProviderRequest] = []
+        failure: Exception | None = None
+        with self._request_lock:
+            cancelled: set[_ProviderRequest] = set()
+            for reservation, request in tuple(self._reservations.items()):
+                if reservation.runtime == runtime:
+                    self._reservations.pop(reservation, None)
+                    request.cancelled = True
+                    cancelled.add(request)
+                    pending.append(request)
+            for request in tuple(self._active_requests.values()):
+                if request.runtime == runtime:
+                    request.cancelled = True
+                    cancelled.add(request)
+            with self._capability_state_lock:
+                for waiter, request in tuple(self._capability_waiters.items()):
+                    if request in cancelled:
+                        self._capability_waiters.pop(waiter, None)
+                capability_owner = self._capability_owner
+                cancel_capability = (
+                    capability_owner is not None and not self._capability_waiters
+                )
+            try:
+                self._executor.cancel(runtime)
+            except Exception as exc:  # noqa: BLE001 - finish every cleanup action
+                failure = exc
+            if cancel_capability:
+                try:
+                    self._executor.cancel(f"capability:{capability_owner[0]}")
+                except Exception as exc:  # noqa: BLE001 - finish all cleanup actions
+                    if failure is None:
+                        failure = exc
+        for request in pending:
+            try:
+                self._executor.release(request.handle)
+            except Exception as exc:  # noqa: BLE001 - finish all cleanup actions
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
+
+    def close(self) -> None:
+        with self._request_lock:
+            if self._closed:
+                return
+            self._closed = True
+            pending = tuple(self._reservations.values())
+            self._reservations.clear()
+            for request in (*pending, *tuple(self._active_requests.values())):
+                request.cancelled = True
+            with self._capability_state_lock:
+                self._capability_waiters.clear()
+        failure: Exception | None = None
+        for request in pending:
+            try:
+                self._executor.release(request.handle)
+            except Exception as exc:  # noqa: BLE001 - close every owned resource
+                if failure is None:
+                    failure = exc
+        try:
+            self._executor.close()
+        except Exception as exc:  # noqa: BLE001 - report after pending cleanup
+            if failure is None:
+                failure = exc
+        if failure is not None:
+            raise failure
+
+
+@dataclass
+class _Lane:
+    generation: int
+    snapshot: RuntimeSnapshot
+    active_token: object | None = None
+    rerun_trigger: str | None = None
+
+
+@dataclass(frozen=True)
+class _RefreshWork:
+    runtime: str
+    generation: int
+    token: object
+    run: Callable[[], None]
+    reject: Callable[[], None]
+
+
+class RefreshCoordinator:
+    def __init__(
+        self,
+        gateway: object,
+        settings: dict[str, object],
+        settings_store: object | None = None,
+        on_snapshot: Callable[[ViewSnapshot], object] | None = None,
+        worker_submit: Callable[[str, Callable[[], None]], object] | None = None,
+        callback_submit: Callable[[Callable[[], None]], object] | None = None,
+        global_error: str | None = None,
+    ) -> None:
+        self._gateway = gateway
+        self._settings = _normalized_settings(settings)
+        self._settings_store = settings_store
+        self._on_snapshot = on_snapshot
+        self._worker_submit = worker_submit or self._thread_submit
+        self._callback_submit = callback_submit or (lambda callback: callback())
+        self._global_errors: dict[str, str] = {}
+        if global_error:
+            message = sanitize_diagnostic(global_error)
+            self._global_errors[self._error_key(message)] = message
+        self._lock = threading.RLock()
+        self._admission_lock = threading.RLock()
+        self._dispatch_lock = threading.RLock()
+        self._settings_commit_lock = threading.Lock()
+        self._closed = False
+        self._generations = {runtime: 0 for runtime in RUNTIMES}
+        self._lanes: dict[str, _Lane] = {}
+        for runtime in RUNTIMES:
+            if self._runtime_config(runtime)["poll"]:
+                self._lanes[runtime] = _Lane(
+                    0, RuntimeSnapshot(runtime=runtime, state="pending")
+                )
+
+    @staticmethod
+    def _thread_submit(runtime: str, job: Callable[[], None]) -> None:
+        threading.Thread(
+            target=job, name=f"codexbar-{runtime}-refresh", daemon=False
+        ).start()
+
+    def _submit_job(self, work: _RefreshWork) -> None:
+        accepted = False
+        with self._admission_lock:
+            with self._lock:
+                lane = self._lanes.get(work.runtime)
+                accepted = (
+                    not self._closed
+                    and lane is not None
+                    and lane.generation == work.generation
+                    and lane.active_token is work.token
+                )
+            if accepted:
+                try:
+                    self._worker_submit(work.runtime, work.run)
+                except Exception:  # noqa: BLE001 - release reserved work
+                    accepted = False
+        if not accepted:
+            work.reject()
+
+    def _runtime_config(self, runtime: str) -> dict[str, bool]:
+        return self._settings["runtimes"][runtime]
+
+    @staticmethod
+    def _error_key(message: str) -> str:
+        if message.startswith("Settings error:"):
+            return "settings"
+        if message.startswith("Cleanup error:"):
+            return "cleanup"
+        if "StatusNotifierWatcher" in message:
+            return "watcher"
+        return "general"
+
+    def _global_error_locked(self) -> str | None:
+        if not self._global_errors:
+            return None
+        values = tuple(self._global_errors.values())
+        separator = " | "
+        display_limit = MAX_DIAGNOSTIC_CHARS - len("CodexBar: ERROR: ")
+        value_limit = max(
+            1, (display_limit - len(separator) * (len(values) - 1)) // len(values)
+        )
+        bounded = tuple(
+            value
+            if len(value) <= value_limit
+            else value[: max(0, value_limit - 3)] + "..."
+            for value in values
+        )
+        return separator.join(bounded)
+
+    def _snapshot_locked(self) -> ViewSnapshot:
+        return ViewSnapshot(
+            tuple(
+                self._lanes[runtime].snapshot
+                for runtime in RUNTIMES
+                if runtime in self._lanes
+            ),
+            self._global_error_locked(),
+        )
+
+    def snapshot(self) -> ViewSnapshot:
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _emit(self, snapshot: ViewSnapshot | None) -> None:
+        if snapshot is None or self._on_snapshot is None:
+            return
+        with self._dispatch_lock:
+            with self._lock:
+                if self._closed:
+                    return
+                snapshot = self._snapshot_locked()
+            _attempt(lambda: self._on_snapshot(snapshot))
+
+    def _make_job(self, runtime: str, generation: int, token: object) -> _RefreshWork:
+        reservation: object | None = None
+        reservation_failure: RuntimeFailure | None = None
+        try:
+            reservation = self._gateway.reserve(runtime)
+        except Exception as exc:  # noqa: BLE001 - gateway reservation boundary
+            reservation_failure = RuntimeFailure(
+                runtime, "runtime", sanitize_diagnostic(exc)
+            )
+
+        def publish(outcome: object) -> None:
+            with self._dispatch_lock:
+                with self._lock:
+                    if self._closed:
+                        return
+                complete = lambda: self._complete(runtime, generation, token, outcome)
+                try:
+                    self._callback_submit(complete)
+                except Exception:  # noqa: BLE001 - dispatch fallback is synchronous
+                    complete()
+
+        def run() -> None:
+            with self._admission_lock, self._lock:
+                lane = self._lanes.get(runtime)
+                current = (
+                    not self._closed
+                    and lane is not None
+                    and lane.generation == generation
+                    and lane.active_token is token
+                )
+            if not current:
+                reject()
+                return
+            if reservation_failure is not None:
+                outcome: object = reservation_failure
+            else:
+                try:
+                    outcome = self._gateway.fetch(runtime, reservation)
+                except Exception as exc:  # noqa: BLE001 - isolate a faulty gateway
+                    outcome = RuntimeFailure(
+                        runtime, "runtime", sanitize_diagnostic(exc)
+                    )
+            publish(outcome)
+
+        def reject() -> None:
+            if reservation is not None:
+                _attempt(lambda: self._gateway.release(reservation))
+            publish(
+                RuntimeFailure(
+                    runtime,
+                    "scheduler",
+                    "refresh worker could not be started",
+                )
+            )
+
+        return _RefreshWork(runtime, generation, token, run, reject)
+
+    def request(
+        self,
+        runtimes: tuple[str, ...] | list[str],
+        trigger: str = "manual",
+    ) -> None:
+        jobs: list[_RefreshWork] = []
+        with self._lock:
+            if self._closed:
+                return
+            for runtime in RUNTIMES:
+                if runtime not in runtimes or runtime not in self._lanes:
+                    continue
+                if (
+                    trigger == "auto"
+                    and not self._runtime_config(runtime)["autoRefresh"]
+                ):
+                    continue
+                lane = self._lanes[runtime]
+                if lane.active_token is not None:
+                    if trigger == "manual" or lane.rerun_trigger is None:
+                        lane.rerun_trigger = trigger
+                    continue
+                token = object()
+                lane.active_token = token
+                lane.snapshot = replace(lane.snapshot, refreshing=True)
+                jobs.append(self._make_job(runtime, lane.generation, token))
+            published = self._snapshot_locked() if jobs else None
+        self._emit(published)
+        for job in jobs:
+            self._submit_job(job)
+
+    def _complete(
+        self,
+        runtime: str,
+        generation: int,
+        token: object,
+        outcome: object,
+    ) -> None:
+        rerun: _RefreshWork | None = None
+        with self._lock:
+            if self._closed:
+                return
+            lane = self._lanes.get(runtime)
+            if (
+                lane is None
+                or lane.generation != generation
+                or lane.active_token is not token
+            ):
+                return
+            previous = lane.snapshot
+            if isinstance(outcome, RuntimeResult) and outcome.runtime == runtime:
+                lane.snapshot = RuntimeSnapshot(
+                    runtime=runtime,
+                    state="good",
+                    usage=outcome.usage,
+                    source=outcome.source,
+                )
+            else:
+                if not isinstance(outcome, RuntimeFailure):
+                    outcome = RuntimeFailure(
+                        runtime, "runtime", "invalid provider result"
+                    )
+                if previous.usage is None:
+                    lane.snapshot = RuntimeSnapshot(
+                        runtime=runtime,
+                        state="error",
+                        error=sanitize_diagnostic(outcome.message),
+                    )
+                else:
+                    lane.snapshot = replace(
+                        previous,
+                        state="stale",
+                        error=sanitize_diagnostic(outcome.message),
+                        refreshing=False,
+                    )
+            lane.active_token = None
+            lane.snapshot = replace(lane.snapshot, refreshing=False)
+            rerun_trigger = lane.rerun_trigger
+            lane.rerun_trigger = None
+            if rerun_trigger == "manual" or (
+                rerun_trigger == "auto" and self._runtime_config(runtime)["autoRefresh"]
+            ):
+                next_token = object()
+                lane.active_token = next_token
+                lane.snapshot = replace(lane.snapshot, refreshing=True)
+                rerun = self._make_job(runtime, lane.generation, next_token)
+            published = self._snapshot_locked()
+        self._emit(published)
+        if rerun is not None:
+            self._submit_job(rerun)
+
+    def request_manual(self) -> None:
+        self.request(RUNTIMES, trigger="manual")
+
+    def request_auto(self) -> None:
+        self.request(RUNTIMES, trigger="auto")
+
+    def _settings_error(self, exc: object) -> bool:
+        message = (
+            exc.message
+            if isinstance(exc, SettingsFailure)
+            else sanitize_diagnostic(exc)
+        )
+        with self._lock:
+            if self._closed:
+                return False
+            error = sanitize_diagnostic(f"Settings error: {message}")
+            self._global_errors["settings"] = error
+            published = self._snapshot_locked()
+        self._emit(published)
         return False
 
-    def show_details(self, *_: object) -> None:
-        text = self.last_summary
-        if self.last_raw:
-            text += "\n\nRaw JSON:\n" + self.last_raw
-        subprocess.Popen(
-            ["zenity", "--text-info", "--title", "CodexBar", "--width", "900", "--height", "650"],
-            stdin=subprocess.PIPE,
-            text=True,
-        ).communicate(text)
+    def _commit_settings(self, normalized: dict[str, object]) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+        try:
+            if self._settings_store is not None:
+                self._settings_store.save(normalized)
+        except Exception as exc:  # noqa: BLE001 - persistence boundary
+            return self._settings_error(exc)
+
+        cancelled: list[str] = []
+        with self._admission_lock, self._lock:
+            if self._closed:
+                return False
+            old_enabled = {runtime for runtime in RUNTIMES if runtime in self._lanes}
+            new_enabled = {
+                runtime
+                for runtime in RUNTIMES
+                if normalized["runtimes"][runtime]["poll"]
+            }
+            self._settings = normalized
+            for runtime in old_enabled - new_enabled:
+                lane = self._lanes.pop(runtime)
+                self._generations[runtime] = lane.generation + 1
+                if lane.active_token is not None:
+                    cancelled.append(runtime)
+            for runtime in new_enabled - old_enabled:
+                self._generations[runtime] += 1
+                generation = self._generations[runtime]
+                self._lanes[runtime] = _Lane(
+                    generation, RuntimeSnapshot(runtime=runtime, state="pending")
+                )
+            self._global_errors.pop("settings", None)
+        cleanup_failures: list[str] = []
+        for runtime in cancelled:
+            try:
+                self._gateway.cancel(runtime)
+            except Exception as exc:  # noqa: BLE001 - commit already succeeded
+                cleanup_failures.append(type(exc).__name__)
+        with self._lock:
+            if not self._closed:
+                if cleanup_failures:
+                    failure_types = ", ".join(dict.fromkeys(cleanup_failures))
+                    self._global_errors["cleanup"] = sanitize_diagnostic(
+                        f"Cleanup error: provider cancellation failed: {failure_types}"
+                    )
+                elif cancelled:
+                    self._global_errors.pop("cleanup", None)
+                published = self._snapshot_locked()
+            else:
+                published = None
+        self._emit(published)
+        return True
+
+    def update_settings(self, settings: dict[str, object]) -> bool:
+        try:
+            normalized = _normalized_settings(settings)
+        except Exception as exc:  # noqa: BLE001 - settings boundary is fail-closed
+            return self._settings_error(exc)
+        with self._settings_commit_lock:
+            return self._commit_settings(normalized)
+
+    def update_setting(
+        self, runtime: str, key: str, active: bool
+    ) -> dict[str, object] | None:
+        with self._settings_commit_lock:
+            try:
+                with self._lock:
+                    if self._closed:
+                        return None
+                    candidate = _settings_with_toggle(
+                        self._settings, runtime, key, active
+                    )
+            except Exception as exc:  # noqa: BLE001 - command boundary is fail-closed
+                self._settings_error(exc)
+                return None
+            if not self._commit_settings(candidate):
+                return None
+            return copy.deepcopy(candidate)
+
+    def set_global_error(self, message: str | None) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            if message:
+                sanitized = sanitize_diagnostic(message)
+                self._global_errors[self._error_key(sanitized)] = sanitized
+            else:
+                self._global_errors.clear()
+            published = self._snapshot_locked()
+        self._emit(published)
+
+    def close(self) -> None:
+        with self._admission_lock, self._dispatch_lock, self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for lane in self._lanes.values():
+                lane.generation += 1
+                lane.rerun_trigger = None
+        self._gateway.close()
 
 
-def main() -> None:
-    indicator = CodexBarIndicator()
-    Gtk.main()
-    del indicator
+def _bar(percent: int) -> str:
+    filled = max(0, min(10, round(percent / 10)))
+    if percent > 0 and filled == 0:
+        filled = 1
+    return "█" * filled + "░" * (10 - filled)
+
+
+def _percent(window: UsageWindow | None) -> str:
+    return "--" if window is None else f"{window.percent}%"
+
+
+class IndicatorView:
+    def __init__(
+        self,
+        panel_indicator: object,
+        on_refresh: Callable[[], object] | None = None,
+        on_quit: Callable[[], object] | None = None,
+        settings: dict[str, object] | None = None,
+        on_setting_toggle: Callable[
+            [str, str, bool, Callable[[dict[str, object] | None], None]], object
+        ]
+        | None = None,
+    ) -> None:
+        self._panel = panel_indicator
+        self._on_refresh = on_refresh or (lambda: None)
+        self._on_quit = on_quit or (lambda: None)
+        self._on_setting_toggle = on_setting_toggle
+        self._settings = copy.deepcopy(settings or DEFAULT_SETTINGS)
+        self._syncing = False
+        self._settings_pending = False
+        self._settings_generation = 0
+        self._closed = False
+        self._dynamic_items: list[Gtk.MenuItem] = []
+        self._details_text = "No provider details available."
+        self.details_dialog: Gtk.Dialog | None = None
+        self.menu = Gtk.Menu()
+        self._dynamic_separator = Gtk.SeparatorMenuItem()
+        self.menu.append(self._dynamic_separator)
+        details = Gtk.MenuItem(label="Show details")
+        details.connect("activate", lambda *_args: self.show_details())
+        self.menu.append(details)
+        self.menu.append(Gtk.SeparatorMenuItem())
+        settings_title = Gtk.MenuItem(label="Runtime limit polling")
+        settings_title.set_sensitive(False)
+        self.menu.append(settings_title)
+        self._setting_items: dict[tuple[str, str], Gtk.CheckMenuItem] = {}
+        for runtime in RUNTIMES:
+            for key, prefix in (("poll", "Poll"), ("autoRefresh", "Auto-refresh")):
+                item = Gtk.CheckMenuItem(label=f"{prefix} {RUNTIME_LABELS[runtime]}")
+                item.connect("toggled", self._toggle_setting, runtime, key)
+                self.menu.append(item)
+                self._setting_items[(runtime, key)] = item
+        self.menu.append(Gtk.SeparatorMenuItem())
+        refresh_item = Gtk.MenuItem(label="Refresh")
+        refresh_item.connect("activate", lambda *_args: self._on_refresh())
+        self.menu.append(refresh_item)
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", lambda *_args: self._on_quit())
+        self.menu.append(quit_item)
+        self._sync_settings_items()
+        self.menu.show_all()
+        self._panel.set_menu(self.menu)
+
+    def _sync_settings_items(self) -> None:
+        self._syncing = True
+        try:
+            for runtime in RUNTIMES:
+                values = self._settings["runtimes"][runtime]
+                poll = self._setting_items[(runtime, "poll")]
+                auto = self._setting_items[(runtime, "autoRefresh")]
+                poll.set_active(values["poll"])
+                auto.set_active(values["autoRefresh"])
+                poll.set_sensitive(not self._settings_pending)
+                auto.set_sensitive(not self._settings_pending and values["poll"])
+        finally:
+            self._syncing = False
+
+    def _toggle_setting(self, item: Gtk.CheckMenuItem, runtime: str, key: str) -> None:
+        if self._syncing or self._closed:
+            return
+        if self._settings_pending:
+            self._sync_settings_items()
+            return
+        requested_active = bool(item.get_active())
+        if self._on_setting_toggle is None:
+            self._sync_settings_items()
+            return
+
+        self._settings_pending = True
+        self._settings_generation += 1
+        generation = self._settings_generation
+        self._sync_settings_items()
+
+        def complete(confirmed: dict[str, object] | None) -> None:
+            if self._closed or generation != self._settings_generation:
+                return
+            if confirmed is not None:
+                self._settings = copy.deepcopy(confirmed)
+            self._settings_pending = False
+            self._sync_settings_items()
+
+        try:
+            self._on_setting_toggle(runtime, key, requested_active, complete)
+        except Exception:  # noqa: BLE001 - command boundary rolls back the widget
+            complete(None)
+
+    @staticmethod
+    def _normal_rows(runtime: RuntimeSnapshot) -> list[str]:
+        if runtime.usage is None:
+            return []
+        windows: list[tuple[str, UsageWindow]] = []
+        if runtime.runtime == "codex" and runtime.usage.secondary is not None:
+            windows.append(("Codex Week", runtime.usage.secondary))
+        elif runtime.runtime == "grok":
+            if runtime.usage.primary is not None:
+                windows.append(("Grok Session", runtime.usage.primary))
+            if runtime.usage.secondary is not None:
+                windows.append(("Grok Week", runtime.usage.secondary))
+        elif runtime.runtime == "claude":
+            if runtime.usage.primary is not None:
+                name = (
+                    "Claude (Z.AI) 5h" if runtime.source == "zai" else "Claude Session"
+                )
+                windows.append((name, runtime.usage.primary))
+            if runtime.usage.secondary is not None:
+                name = "Claude (Z.AI) 7d" if runtime.source == "zai" else "Claude Week"
+                windows.append((name, runtime.usage.secondary))
+        for extra in runtime.usage.extras:
+            title = extra.provider_title or (
+                "Monthly" if extra.slot == "tertiary" else "Extra"
+            )
+            windows.append((f"{RUNTIME_LABELS[runtime.runtime]} {title}", extra.window))
+        rows = []
+        for name, window in windows:
+            reset = (
+                f" · resets {window.reset_text}"
+                if isinstance(window.reset_text, str) and window.reset_text
+                else ""
+            )
+            percent_text = f"{window.percent}%"
+            row = f"{_bar(window.percent)}  {percent_text:>4}  {name}{reset}"
+            rows.append(
+                row
+                if len(row) <= MAX_DIAGNOSTIC_CHARS
+                else row[: MAX_DIAGNOSTIC_CHARS - 3] + "..."
+            )
+        return rows
+
+    @staticmethod
+    def _detail_rows(runtime: RuntimeSnapshot) -> list[str]:
+        if runtime.usage is None:
+            return []
+        owner = (
+            "Claude (Z.AI)"
+            if runtime.runtime == "claude" and runtime.source == "zai"
+            else RUNTIME_LABELS[runtime.runtime]
+        )
+        names = ("5h", "7d") if runtime.source == "zai" else ("session", "weekly")
+        rows = [
+            sanitize_diagnostic(f"{owner} {name}: {window.percent}%")
+            for name, window in zip(
+                names,
+                (runtime.usage.primary, runtime.usage.secondary),
+                strict=True,
+            )
+            if isinstance(window, UsageWindow)
+        ]
+        rows.extend(
+            sanitize_diagnostic(
+                f"{owner} "
+                f"{extra.provider_title or ('monthly' if extra.slot == 'tertiary' else 'extra')}: "
+                f"{extra.window.percent}%"
+            )
+            for extra in runtime.usage.extras
+            if isinstance(extra, UsageExtra) and isinstance(extra.window, UsageWindow)
+        )
+        return rows
+
+    @staticmethod
+    def _panel_tokens(
+        snapshot: ViewSnapshot, guide: bool = False
+    ) -> tuple[list[str], bool]:
+        by_runtime = {item.runtime: item for item in snapshot.runtimes}
+        tokens: list[str] = []
+        problem = bool(snapshot.global_error)
+        for runtime in RUNTIMES:
+            item = by_runtime.get(runtime)
+            if item is None:
+                continue
+            problem = problem or item.state in {"stale", "error"}
+            usage = item.usage
+            if runtime == "codex":
+                value = usage.secondary if usage is not None else None
+                tokens.append(f"CxW {'100%' if guide else _percent(value)}")
+            elif runtime == "grok":
+                value = usage.primary if usage is not None else None
+                tokens.append(f"GkS {'100%' if guide else _percent(value)}")
+            else:
+                primary = usage.primary if usage is not None else None
+                secondary = usage.secondary if usage is not None else None
+                values = (
+                    "100%/100%"
+                    if guide
+                    else f"{_percent(primary)}/{_percent(secondary)}"
+                )
+                tokens.append(f"Cl {values}")
+        return tokens, problem
+
+    def render(self, snapshot: ViewSnapshot) -> None:
+        if self._closed:
+            return
+        for item in self._dynamic_items:
+            self.menu.remove(item)
+        self._dynamic_items.clear()
+        labels: list[str] = []
+        normal_row_count = 0
+        details: list[str] = []
+        by_runtime = {item.runtime: item for item in snapshot.runtimes}
+        runtime_groups = [
+            (runtime, item, self._normal_rows(item))
+            for runtime in RUNTIMES
+            if (item := by_runtime.get(runtime)) is not None
+        ]
+        remaining_groups = sum(bool(rows) for _runtime, _item, rows in runtime_groups)
+        for runtime, item, item_rows in runtime_groups:
+            reserved_for_later = remaining_groups - bool(item_rows)
+            available_rows = max(
+                0,
+                MAX_LIMIT_ROWS - normal_row_count - reserved_for_later,
+            )
+            visible_rows = item_rows[:available_rows]
+            labels.extend(visible_rows)
+            normal_row_count += len(visible_rows)
+            if item_rows:
+                remaining_groups -= 1
+            state: str | None = None
+            if item.state == "pending":
+                state = f"{RUNTIME_LABELS[runtime]}: pending"
+            elif item.state == "good" and not item_rows:
+                state = f"{RUNTIME_LABELS[runtime]}: no quota windows"
+            elif item.state == "error":
+                state = sanitize_diagnostic(
+                    f"{RUNTIME_LABELS[runtime]}: ERROR: "
+                    f"{item.error or 'provider error'}"
+                )
+            elif item.state == "stale":
+                state = sanitize_diagnostic(
+                    f"{RUNTIME_LABELS[runtime]}: STALE: "
+                    f"{item.error or 'provider error'}"
+                )
+            if state is not None:
+                labels.append(state)
+                details.append(state)
+            details.extend(self._detail_rows(item))
+        if snapshot.global_error:
+            state = sanitize_diagnostic(f"CodexBar: ERROR: {snapshot.global_error}")
+            labels.append(state)
+            details.append(state)
+        for index, label in enumerate(labels):
+            menu_item = Gtk.MenuItem(label=label)
+            menu_item.set_sensitive(False)
+            self.menu.insert(menu_item, index)
+            self._dynamic_items.append(menu_item)
+        self.menu.show_all()
+        tokens, problem = self._panel_tokens(snapshot)
+        guide_tokens, _problem = self._panel_tokens(snapshot, guide=True)
+        panel = "  ".join(tokens) or "CodexBar"
+        guide = "  ".join(guide_tokens) or "CodexBar"
+        if problem:
+            panel += " !"
+            guide += " !"
+        self._panel.set_label(panel, guide)
+        self._details_text = ("\n".join(details) or "No provider details available.")[
+            :MAX_DETAILS_CHARS
+        ]
+        if self.details_dialog is not None:
+            self._set_dialog_text(self.details_dialog, self._details_text)
+
+    @staticmethod
+    def _set_dialog_text(dialog: Gtk.Dialog, text: str) -> None:
+        pending = [dialog.get_content_area()]
+        while pending:
+            widget = pending.pop()
+            if isinstance(widget, Gtk.TextView):
+                widget.get_buffer().set_text(text)
+                return
+            if isinstance(widget, Gtk.Container):
+                pending.extend(widget.get_children())
+
+    def show_details(self) -> Gtk.Dialog | None:
+        if self._closed:
+            return None
+        if self.details_dialog is not None:
+            self.details_dialog.present()
+            return self.details_dialog
+        dialog = Gtk.Dialog(title="CodexBar details")
+        dialog.set_modal(False)
+        dialog.set_default_size(620, 380)
+        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+        dialog.connect("response", lambda target, _response: target.hide())
+        dialog.connect("destroy", lambda *_args: setattr(self, "details_dialog", None))
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_hexpand(True)
+        scroller.set_vexpand(True)
+        text_view = Gtk.TextView()
+        text_view.set_editable(False)
+        text_view.set_cursor_visible(False)
+        text_view.set_monospace(True)
+        text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        text_view.get_buffer().set_text(self._details_text[:MAX_DETAILS_CHARS])
+        scroller.add(text_view)
+        dialog.get_content_area().pack_start(scroller, True, True, 0)
+        self.details_dialog = dialog
+        dialog.show_all()
+        return dialog
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._settings_generation += 1
+        if self.details_dialog is not None:
+            dialog = self.details_dialog
+            self.details_dialog = None
+            dialog.destroy()
+
+
+def _status_notifier_watcher_available() -> bool:
+    try:
+        connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        result = connection.call_sync(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameHasOwner",
+            GLib.Variant("(s)", ("org.kde.StatusNotifierWatcher",)),
+            GLib.VariantType("(b)"),
+            Gio.DBusCallFlags.NONE,
+            2000,
+            None,
+        )
+        return bool(result.unpack()[0])
+    except GLib.Error:
+        return False
+
+
+class CodexBarApplication:
+    def __init__(
+        self,
+        coordinator: object | None = None,
+        view: object | None = None,
+        coordinator_factory: Callable[[], object] | None = None,
+        view_factory: Callable[..., object] | None = None,
+        refresh_seconds: int | None = None,
+        timer_add: Callable[[int, Callable[[], bool]], int] = GLib.timeout_add_seconds,
+        timer_remove: Callable[[int], bool] = GLib.source_remove,
+        application_hold: Callable[[], None] | None = None,
+        application_release: Callable[[], None] | None = None,
+        watcher_probe: Callable[[], bool] | None = None,
+        warning_sink: Callable[[str], object] | None = None,
+    ) -> None:
+        self._application = Gtk.Application(
+            application_id=APPLICATION_ID,
+            flags=Gio.ApplicationFlags.FLAGS_NONE,
+        )
+        self._application.connect("activate", self._activate)
+        quit_action = Gio.SimpleAction.new("quit", None)
+        quit_action.connect("activate", lambda *_args: self._request_quit())
+        self._application.add_action(quit_action)
+        self._coordinator = coordinator
+        self._view = view
+        self._coordinator_factory = coordinator_factory
+        self._view_factory = view_factory
+        self._production_default = (
+            coordinator is None
+            and view is None
+            and coordinator_factory is None
+            and view_factory is None
+        )
+        self._refresh_seconds = refresh_seconds
+        self._timer_add = timer_add
+        self._timer_remove = timer_remove
+        self._hold = application_hold or self._application.hold
+        self._release = application_release or self._application.release
+        self._watcher_probe = watcher_probe
+        self._warning_sink = warning_sink or (
+            lambda message: print(message, file=sys.stderr)
+        )
+        self._timer_id: int | None = None
+        self._started = False
+        self._closed = False
+        self._startup_exit_code = 0
+
+    @staticmethod
+    def _idle_submit(callback: Callable[[], None]) -> int:
+        def invoke() -> bool:
+            callback()
+            return False
+
+        return GLib.idle_add(invoke)
+
+    @staticmethod
+    def _settings_submit(callback: Callable[[], None]) -> None:
+        threading.Thread(
+            target=callback,
+            name="codexbar-settings-save",
+            daemon=True,
+        ).start()
+
+    def _update_setting_async(
+        self,
+        runtime: str,
+        key: str,
+        active: bool,
+        complete: Callable[[dict[str, object] | None], None],
+    ) -> None:
+        def persist() -> None:
+            confirmed: dict[str, object] | None = None
+            try:
+                if self._coordinator is not None:
+                    confirmed = self._coordinator.update_setting(runtime, key, active)
+            except Exception:  # noqa: BLE001 - lifecycle command boundary
+                confirmed = None
+            self._queue_idle(lambda: complete(confirmed))
+
+        submission_failure = _attempt(lambda: self._settings_submit(persist))
+        if submission_failure is not None:
+            self._queue_idle(lambda: complete(None))
+
+    def _queue_idle(self, callback: Callable[[], None]) -> None:
+        def invoke_if_open() -> None:
+            if not self._closed:
+                _attempt(callback)
+
+        _attempt(lambda: self._idle_submit(invoke_if_open))
+
+    def _create_default_components(self) -> None:
+        config_path = Path(
+            os.environ.get(
+                "CODEXBAR_GNOME_CONFIG",
+                str(Path.home() / ".config" / "codexbar-gnome" / "config.json"),
+            )
+        )
+        store = SettingsStore(config_path)
+        loaded = store.load()
+        gateway = ProviderGateway(
+            ProcessExecutor(),
+            claude_settings_path=Path.home() / ".claude" / "settings.json",
+            source=os.environ.get("CODEXBAR_INDICATOR_SOURCE", ""),
+        )
+        view: IndicatorView | None = None
+        coordinator: RefreshCoordinator | None = None
+
+        def request_refresh() -> None:
+            if coordinator is not None:
+                _attempt(coordinator.request_manual)
+
+        def publish_snapshot(snapshot: ViewSnapshot) -> None:
+            self._queue_idle(
+                lambda: view.render(snapshot) if view is not None else None
+            )
+
+        try:
+            panel = AppIndicator.Indicator.new(
+                INDICATOR_ID,
+                "utilities-system-monitor",
+                AppIndicator.IndicatorCategory.SYSTEM_SERVICES,
+            )
+            panel.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+            panel.set_title("CodexBar")
+            view = IndicatorView(
+                panel,
+                on_refresh=request_refresh,
+                on_quit=self._request_quit,
+                settings=loaded.settings,
+                on_setting_toggle=self._update_setting_async,
+            )
+            global_error = (
+                f"Settings error: {loaded.failure.message}" if loaded.failure else None
+            )
+            coordinator = RefreshCoordinator(
+                gateway,
+                loaded.settings,
+                settings_store=store,
+                on_snapshot=publish_snapshot,
+                callback_submit=self._idle_submit,
+                global_error=global_error,
+            )
+            view.render(coordinator.snapshot())
+        except Exception:
+            if coordinator is not None:
+                _attempt(coordinator.close)
+            else:
+                _attempt(gateway.close)
+            if view is not None:
+                _attempt(view.close)
+            raise
+        self._view = view
+        self._coordinator = coordinator
+
+    def _ensure_components(self) -> None:
+        if self._coordinator is not None and self._view is not None:
+            return
+        if self._production_default:
+            self._create_default_components()
+            return
+        if self._coordinator is None and self._coordinator_factory is not None:
+            self._coordinator = self._coordinator_factory()
+        if self._view is None and self._view_factory is not None:
+            self._view = self._view_factory()
+        if self._coordinator is None or self._view is None:
+            raise RuntimeError("application factories did not create components")
+
+    def _activate(self, _application: Gtk.Application) -> None:
+        if self._closed:
+            return
+        try:
+            self.start()
+        except Exception as exc:  # noqa: BLE001 - GObject swallows signal failures
+            self._startup_exit_code = 1
+            warning = sanitize_diagnostic(
+                f"CodexBar startup failed: {type(exc).__name__}"
+            )
+            _attempt(lambda: self._warning_sink(warning))
+            self._application.quit()
+
+    def _timer_callback(self) -> bool:
+        if self._closed:
+            return False
+        _attempt(self._coordinator.request_auto)
+        return True
+
+    def _probe_watcher_async(self, probe: Callable[[], bool]) -> None:
+        def run_probe() -> None:
+            try:
+                available = bool(probe())
+            except Exception:  # noqa: BLE001 - optional desktop capability probe
+                available = False
+            if available:
+                return
+
+            def publish_warning() -> None:
+                if self._closed:
+                    return
+                warning = sanitize_diagnostic(
+                    "StatusNotifierWatcher is unavailable; the panel icon may be hidden"
+                )
+                _attempt(lambda warning=warning: self._warning_sink(warning))
+                if hasattr(self._coordinator, "set_global_error"):
+                    _attempt(lambda: self._coordinator.set_global_error(warning))
+
+            self._queue_idle(publish_warning)
+
+        threading.Thread(
+            target=run_probe,
+            name="codexbar-watcher-probe",
+            daemon=True,
+        ).start()
+
+    def start(self) -> None:
+        if self._started or self._closed:
+            return
+        try:
+            self._ensure_components()
+            self._hold()
+            self._started = True
+            probe = self._watcher_probe
+            if probe is None and self._production_default:
+                probe = _status_notifier_watcher_available
+            if probe is not None:
+                self._probe_watcher_async(probe)
+            seconds = self._refresh_seconds
+            if seconds is None:
+                seconds = parse_refresh_seconds(
+                    os.environ.get("CODEXBAR_INDICATOR_REFRESH_SECONDS"),
+                    self._warning_sink,
+                )
+            self._timer_id = self._timer_add(seconds, self._timer_callback)
+            self._coordinator.request_auto()
+        except Exception:
+            self.shutdown()
+            raise
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        cleanup: list[tuple[str, Callable[[], object]]] = []
+        if self._timer_id is not None:
+            timer_id = self._timer_id
+            self._timer_id = None
+            cleanup.append(("timer removal", lambda: self._timer_remove(timer_id)))
+        if self._coordinator is not None:
+            cleanup.append(("coordinator close", self._coordinator.close))
+        if self._view is not None:
+            cleanup.append(("view close", self._view.close))
+        if self._started:
+            self._started = False
+            cleanup.append(("application release", self._release))
+        for label, action in cleanup:
+            try:
+                action()
+            except Exception as exc:  # noqa: BLE001 - shutdown must finish every owner
+                warning = sanitize_diagnostic(
+                    f"Shutdown {label} failed: {type(exc).__name__}"
+                )
+                _attempt(lambda warning=warning: self._warning_sink(warning))
+
+    def _request_quit(self) -> bool:
+        self.shutdown()
+        self._application.quit()
+        return False
+
+    def run(self, argv: list[str]) -> int:
+        initialized, _remaining = Gtk.init_check([])
+        if not initialized:
+            print("CodexBar requires a graphical display", file=sys.stderr)
+            return 1
+        old_handlers: dict[int, object] = {}
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            old_handlers[signum] = signal.getsignal(signum)
+            signal.signal(
+                signum,
+                lambda _signum, _frame: GLib.idle_add(self._request_quit),
+            )
+        try:
+            result = self._application.run(argv)
+        finally:
+            self.shutdown()
+            for signum, handler in old_handlers.items():
+                signal.signal(signum, handler)
+        return self._startup_exit_code or result
+
+
+def main() -> int:
+    return CodexBarApplication().run(sys.argv)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

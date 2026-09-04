@@ -1,0 +1,63 @@
+name: Quality
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install native test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            bubblewrap \
+            dbus-x11 \
+            desktop-file-utils \
+            gir1.2-ayatanaappindicator3-0.1 \
+            gir1.2-gtk-3.0 \
+            libgl1-mesa-dri \
+            libglib2.0-bin \
+            libgtk-3-bin \
+            python3-gi \
+            python3-venv \
+            shellcheck \
+            xvfb
+
+      - name: Install pinned Python quality tools
+        run: |
+          python3 -m venv --system-site-packages .quality-venv
+          .quality-venv/bin/python -m pip install --disable-pip-version-check ruff==0.16.4
+          echo "$GITHUB_WORKSPACE/.quality-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Run the blocking quality gate
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: scripts/quality-gate.sh
+
+      - name: Upload exact-SHA quality evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: quality-gate-${{ matrix.os }}
+          path: .release/evidence/quality-gate.json
+          if-no-files-found: error
+          retention-days: 14

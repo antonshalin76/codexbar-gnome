@@ -3,3 +3,7 @@ __pycache__/
 .DS_Store
 *.log
 .scannerwork/
+.quality-venv/
+dist/
+.release/
+.papercuts.jsonl
