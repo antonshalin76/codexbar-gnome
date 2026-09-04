@@ -269,12 +269,12 @@ class IsolatedHome:
         prefix = [
             "/usr/bin/bwrap",
             "--die-with-parent",
-            "--unshare-net",
             "--unshare-user",
             "--uid",
             "0",
             "--gid",
             "0",
+            "--unshare-net",
         ]
         if pid_namespace:
             prefix += ["--unshare-pid", "--as-pid-1"]
@@ -330,12 +330,12 @@ class IsolatedHome:
         prefix = [
             "/usr/bin/bwrap",
             "--die-with-parent",
-            "--unshare-net",
             "--unshare-user",
             "--uid",
             "0",
             "--gid",
             "0",
+            "--unshare-net",
         ]
         if pid_namespace:
             prefix += ["--unshare-pid", "--as-pid-1"]
