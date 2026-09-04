@@ -3389,14 +3389,21 @@ raise SystemExit(application.run([sys.argv[0]]))
             try:
                 _wait_for_application_owner(env)
                 self.assertIsNone(process.poll())
-                readable, _writable, _exceptional = select.select(
-                    [process.stderr], [], [], 3
-                )
-                self.assertEqual(readable, [process.stderr])
-                watcher_warning = process.stderr.readline()
+                warning_lines: list[str] = []
+                deadline = time.monotonic() + 3
+                while "StatusNotifierWatcher" not in "".join(warning_lines):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    readable, _writable, _exceptional = select.select(
+                        [process.stderr], [], [], remaining
+                    )
+                    if not readable:
+                        break
+                    warning_lines.append(process.stderr.readline())
                 _quit_application(env)
                 stdout, stderr = process.communicate(timeout=5)
-                stderr = watcher_warning + stderr
+                stderr = "".join(warning_lines) + stderr
                 self.assertEqual(process.returncode, 0, stdout + stderr)
                 self.assertIn("StatusNotifierWatcher", stderr)
                 self.assertFalse(marker.exists())

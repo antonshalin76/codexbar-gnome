@@ -48,6 +48,10 @@ jobs:
           .quality-venv/bin/python -m pip install --disable-pip-version-check ruff==0.16.4
           echo "$GITHUB_WORKSPACE/.quality-venv/bin" >> "$GITHUB_PATH"
 
+      - name: Allow the bubblewrap test sandbox on Ubuntu 24.04
+        if: matrix.os == 'ubuntu-24.04'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Run the blocking quality gate
         env:
           GITHUB_SHA: ${{ github.sha }}
