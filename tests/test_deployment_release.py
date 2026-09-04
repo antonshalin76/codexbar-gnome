@@ -2338,10 +2338,17 @@ elif len(args) >= 5 and args[:3] == ["-R", "fixture/codexbar-gnome", "release"]:
         assets = []
         for path in (archive, checksum):
             payload = path.read_bytes()
+            digest = (
+                None
+                if os.environ.get("FAKE_VERIFY_NULL_DIGEST") == "1"
+                else "sha256:" + hashlib.sha256(payload).hexdigest()
+            )
+            if path == archive and os.environ.get("FAKE_VERIFY_ARCHIVE_DIGEST"):
+                digest = os.environ["FAKE_VERIFY_ARCHIVE_DIGEST"]
             assets.append({
                 "name": path.name,
                 "size": len(payload),
-                "digest": "sha256:" + hashlib.sha256(payload).hexdigest(),
+                "digest": digest,
             })
         print(json.dumps({
             "tagName": "v0.1.0",
@@ -3107,6 +3114,7 @@ else:
                 "FAKE_VERIFY_ARCHIVE": self.sandbox.guest(output / ARCHIVE_NAME),
                 "FAKE_VERIFY_CHECKSUM": self.sandbox.guest(output / CHECKSUM_NAME),
                 "FAKE_VERIFY_HEAD": head,
+                "FAKE_VERIFY_NULL_DIGEST": "1",
             }
         )
         foreign = self.sandbox.home / ".local" / "bin" / "codexbar-gnome-indicator"
@@ -3140,6 +3148,65 @@ else:
             },
         )
 
+        advanced = self.sandbox.command(
+            [
+                "/usr/bin/git",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "post-release tooling",
+            ],
+            cwd=candidate,
+        )
+        self.assertEqual(advanced.returncode, 0, advanced.stderr)
+        verified_after_head_advance = self.sandbox.command(
+            [
+                "/bin/sh",
+                self.sandbox.guest(candidate / "scripts" / "verify-release.sh"),
+            ],
+            cwd=candidate,
+            env=env,
+            timeout=30,
+        )
+        self.assertEqual(
+            verified_after_head_advance.returncode,
+            0,
+            verified_after_head_advance.stderr,
+        )
+        self.assertEqual(json.loads(q05.read_text(encoding="utf-8"))["commitSha"], head)
+
+        q04b = candidate / manifest["scenarios"]["BDD-Q04B"]["receipt"]
+        original_receipt = json.loads(q04b.read_text(encoding="utf-8"))
+        sha256_head = "a" * 64
+        q04b.write_text(
+            json.dumps({**original_receipt, "commitSha": sha256_head}) + "\n",
+            encoding="utf-8",
+        )
+        sha256_env = dict(env)
+        sha256_env["FAKE_VERIFY_HEAD"] = sha256_head
+        verified_sha256_commit = self.sandbox.command(
+            [
+                "/bin/sh",
+                self.sandbox.guest(candidate / "scripts" / "verify-release.sh"),
+            ],
+            cwd=candidate,
+            env=sha256_env,
+            timeout=30,
+        )
+        self.assertEqual(
+            verified_sha256_commit.returncode,
+            0,
+            verified_sha256_commit.stderr,
+        )
+        self.assertEqual(
+            json.loads(q05.read_text(encoding="utf-8"))["commitSha"], sha256_head
+        )
+        q04b.write_text(json.dumps(original_receipt) + "\n", encoding="utf-8")
+
         q05.unlink()
         wrong_repository_env = dict(env)
         wrong_repository_env["FAKE_VERIFY_REPOSITORY"] = "other/project"
@@ -3156,7 +3223,22 @@ else:
         self.assertIn("repository", wrong_repository.stderr.lower())
         self.assertFalse(q05.exists())
 
-        q04b = candidate / manifest["scenarios"]["BDD-Q04B"]["receipt"]
+        wrong_api_digest_env = dict(env)
+        wrong_api_digest_env.pop("FAKE_VERIFY_NULL_DIGEST")
+        wrong_api_digest_env["FAKE_VERIFY_ARCHIVE_DIGEST"] = "sha256:" + "0" * 64
+        wrong_api_digest = self.sandbox.command(
+            [
+                "/bin/sh",
+                self.sandbox.guest(candidate / "scripts" / "verify-release.sh"),
+            ],
+            cwd=candidate,
+            env=wrong_api_digest_env,
+            timeout=20,
+        )
+        self.assertNotEqual(wrong_api_digest.returncode, 0)
+        self.assertIn("digest", wrong_api_digest.stderr.lower())
+        self.assertFalse(q05.exists())
+
         receipt = json.loads(q04b.read_text(encoding="utf-8"))
         receipt["archiveSha256"] = "0" * 64
         q04b.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
@@ -3203,7 +3285,7 @@ else:
             timeout=20,
         )
         self.assertNotEqual(altered_assets.returncode, 0)
-        self.assertIn("digest", altered_assets.stderr.lower())
+        self.assertRegex(altered_assets.stderr.lower(), r"digest|match q04b")
         self.assertFalse(q05.exists())
 
     def test_bdd_q04a_preserves_preexisting_state_and_retry_is_idempotent(
