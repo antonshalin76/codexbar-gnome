@@ -2210,7 +2210,6 @@ if args[:2] != ["release", "view"] and os.environ.get("FAKE_GH_FAIL_OPERATION") 
     raise SystemExit(97)
 
 if args[:2] == ["release", "view"]:
-    save()
     view_number = sum(
         call[:2] == ["release", "view"] for call in state["calls"]
     )
@@ -2218,8 +2217,18 @@ if args[:2] == ["release", "view"]:
         print("injected release view failure", file=sys.stderr)
         raise SystemExit(97)
     if state["release"] is None:
+        save()
         raise SystemExit(1)
-    print(json.dumps(state["release"], sort_keys=True))
+    release = state["release"]
+    delayed_views = int(os.environ.get("FAKE_GH_DELAY_ASSET_DIGEST_VIEWS", "0"))
+    if release["assets"]:
+        state["assetViewCount"] = state.get("assetViewCount", 0) + 1
+        if state["assetViewCount"] <= delayed_views:
+            release = json.loads(json.dumps(release))
+            for asset in release["assets"]:
+                asset["digest"] = None
+    save()
+    print(json.dumps(release, sort_keys=True))
 elif args[:2] == ["release", "create"]:
     tag = args[2]
     target = args[args.index("--target") + 1]
@@ -3277,6 +3286,7 @@ else:
             success_state,
             success_env,
         ) = self._publication_fixture("publish-success")
+        success_env["FAKE_GH_DELAY_ASSET_DIGEST_VIEWS"] = "2"
         first = self._publish(success_candidate, success_output, success_env)
         self.assertEqual(first.returncode, 0, first.stderr)
         success_head = self.sandbox.command(

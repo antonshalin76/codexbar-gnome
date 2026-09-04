@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -516,6 +517,23 @@ def validate_release(value: dict[str, object], *, draft: bool) -> None:
         raise PublishError("GitHub release asset digest or size does not match")
 
 
+def wait_for_owned_release_assets(*, draft: bool) -> dict[str, object]:
+    deadline = time.monotonic() + 30
+    while True:
+        value = release_view()
+        if value is None:
+            raise PublishError("owned GitHub release disappeared during verification")
+        try:
+            validate_release(value, draft=draft)
+            return value
+        except PublishError as error:
+            if not str(error).startswith("GitHub release asset"):
+                raise
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.5)
+
+
 resume_draft = False
 created_local_tag = False
 created_remote_tag = False
@@ -652,10 +670,7 @@ try:
         gh("release", "upload", tag, str(checksum), "--clobber")
         fail_at("checksum-uploaded")
 
-        draft_release = release_view()
-        if draft_release is None:
-            raise PublishError("draft release disappeared before verification")
-        validate_release(draft_release, draft=True)
+        wait_for_owned_release_assets(draft=True)
         fail_at("verified")
 
     write_publication_marker()
