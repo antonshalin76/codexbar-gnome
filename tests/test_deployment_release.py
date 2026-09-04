@@ -20,7 +20,7 @@ from gi.repository import Gio
 from tests.support import load_indicator
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 APP_ID = "io.github.antonshalin76.CodexBarGnome"
 DESKTOP_NAME = "codexbar-gnome-indicator.desktop"
 ARCHIVE_NAME = f"codexbar-gnome-{VERSION}.tar.gz"
@@ -387,7 +387,14 @@ class IsolatedHome:
                 name
                 for name in names
                 if name
-                in {".git", ".ruff_cache", "__pycache__", "dist", ".papercuts.jsonl"}
+                in {
+                    ".git",
+                    ".release",
+                    ".ruff_cache",
+                    "__pycache__",
+                    "dist",
+                    ".papercuts.jsonl",
+                }
                 or name.endswith(".pyc")
             }
 
@@ -1680,10 +1687,10 @@ try:
     with tarfile.open(archive_name, "r:gz") as archive:
         archive_payloads = {
             "indicator": archive.extractfile(
-                "codexbar-gnome-0.1.0/bin/codexbar-gnome-indicator"
+                "codexbar-gnome-0.1.1/bin/codexbar-gnome-indicator"
             ).read(),
             "desktop": archive.extractfile(
-                "codexbar-gnome-0.1.0/share/codexbar-gnome-indicator.desktop"
+                "codexbar-gnome-0.1.1/share/codexbar-gnome-indicator.desktop"
             ).read(),
         }
     installed_payloads = {
@@ -2351,7 +2358,7 @@ elif len(args) >= 5 and args[:3] == ["-R", "fixture/codexbar-gnome", "release"]:
                 "digest": digest,
             })
         print(json.dumps({
-            "tagName": "v0.1.0",
+            "tagName": "v0.1.1",
             "isDraft": False,
             "targetCommitish": head,
             "assets": assets,
@@ -2455,7 +2462,7 @@ else:
             )
             version_member = archive.extractfile(f"{root}/VERSION")
             self.assertIsNotNone(version_member)
-            self.assertEqual(version_member.read(), b"0.1.0\n")
+            self.assertEqual(version_member.read(), b"0.1.1\n")
             self.assertNotIn(b"SECRET-MARKER", content)
             self.assertIsNone(
                 re.search(rb"(?:sk-|ghp_|github_pat_)[A-Za-z0-9_]{20,}", content)
@@ -2615,7 +2622,7 @@ else:
                     "--list" in tag_args or "-l" in tag_args,
                     f"dry-run used mutating git tag argv: {argv}",
                 )
-        self.assertIn("v0.1.0", result.stdout)
+        self.assertIn("v0.1.1", result.stdout)
         self.assertIn(ARCHIVE_NAME, result.stdout)
 
     def test_bdd_q04a_publication_requires_receipts_bound_to_commit_and_archive(
@@ -2630,7 +2637,7 @@ else:
             self.assertRegex(result.stderr.lower(), r"evidence|receipt")
             self.assertEqual(
                 self.sandbox.command(
-                    ["/usr/bin/git", "tag", "--list", "v0.1.0"], cwd=candidate
+                    ["/usr/bin/git", "tag", "--list", "v0.1.1"], cwd=candidate
                 ).stdout.strip(),
                 "",
             )
@@ -2641,7 +2648,7 @@ else:
                         f"--git-dir={self.sandbox.guest(remote)}",
                         "tag",
                         "--list",
-                        "v0.1.0",
+                        "v0.1.1",
                     ]
                 ).stdout.strip(),
                 "",
@@ -2719,7 +2726,7 @@ else:
         self.assertIn("payload does not match head", rejected.stderr.lower())
         self.assertEqual(
             self.sandbox.command(
-                ["/usr/bin/git", "tag", "--list", "v0.1.0"], cwd=candidate
+                ["/usr/bin/git", "tag", "--list", "v0.1.1"], cwd=candidate
             ).stdout.strip(),
             "",
         )
@@ -2731,7 +2738,7 @@ else:
                     f"--git-dir={self.sandbox.guest(remote)}",
                     "tag",
                     "--list",
-                    "v0.1.0",
+                    "v0.1.1",
                 ]
             ).stdout.strip(),
             "",
@@ -2757,7 +2764,7 @@ else:
 
                     self.assertNotEqual(result.returncode, 0)
                     local_tags = self.sandbox.command(
-                        ["/usr/bin/git", "tag", "--list", "v0.1.0"], cwd=candidate
+                        ["/usr/bin/git", "tag", "--list", "v0.1.1"], cwd=candidate
                     )
                     remote_tags = self.sandbox.command(
                         [
@@ -2765,7 +2772,7 @@ else:
                             f"--git-dir={self.sandbox.guest(remote)}",
                             "tag",
                             "--list",
-                            "v0.1.0",
+                            "v0.1.1",
                         ]
                     )
                     self.assertEqual(local_tags.stdout.strip(), "")
@@ -2789,9 +2796,9 @@ else:
         self.assertFalse(published_release["isDraft"])
         self.assertEqual(
             self.sandbox.command(
-                ["/usr/bin/git", "tag", "--list", "v0.1.0"], cwd=candidate
+                ["/usr/bin/git", "tag", "--list", "v0.1.1"], cwd=candidate
             ).stdout.strip(),
-            "v0.1.0",
+            "v0.1.1",
         )
         self.assertEqual(
             self.sandbox.command(
@@ -2800,10 +2807,10 @@ else:
                     f"--git-dir={self.sandbox.guest(remote)}",
                     "tag",
                     "--list",
-                    "v0.1.0",
+                    "v0.1.1",
                 ]
             ).stdout.strip(),
-            "v0.1.0",
+            "v0.1.1",
         )
         retried = self._publish(candidate, output, env)
         self.assertEqual(retried.returncode, 0, retried.stderr)
@@ -2824,7 +2831,7 @@ else:
                 "user.email=test@example.invalid",
                 "tag",
                 "-a",
-                "v0.1.0",
+                "v0.1.1",
                 "-m",
                 "preexisting exact tag",
             ],
@@ -2832,12 +2839,12 @@ else:
         )
         self.assertEqual(created_tag.returncode, 0, created_tag.stderr)
         pushed_tag = self.sandbox.command(
-            ["/usr/bin/git", "push", "-q", "origin", "refs/tags/v0.1.0"],
+            ["/usr/bin/git", "push", "-q", "origin", "refs/tags/v0.1.1"],
             cwd=tagged_candidate,
         )
         self.assertEqual(pushed_tag.returncode, 0, pushed_tag.stderr)
         tag_object = self.sandbox.command(
-            ["/usr/bin/git", "rev-parse", "v0.1.0^{tag}"], cwd=tagged_candidate
+            ["/usr/bin/git", "rev-parse", "v0.1.1^{tag}"], cwd=tagged_candidate
         ).stdout.strip()
         tagged_env["CODEXBAR_PUBLISH_TEST_FAIL_PHASE"] = "draft-created"
         failed_with_existing_tag = self._publish(
@@ -2849,7 +2856,7 @@ else:
         )
         self.assertEqual(
             self.sandbox.command(
-                ["/usr/bin/git", "rev-parse", "v0.1.0^{tag}"],
+                ["/usr/bin/git", "rev-parse", "v0.1.1^{tag}"],
                 cwd=tagged_candidate,
             ).stdout.strip(),
             tag_object,
@@ -2860,7 +2867,7 @@ else:
                     "/usr/bin/git",
                     f"--git-dir={self.sandbox.guest(tagged_remote)}",
                     "rev-parse",
-                    "refs/tags/v0.1.0^{tag}",
+                    "refs/tags/v0.1.1^{tag}",
                 ]
             ).stdout.strip(),
             tag_object,
@@ -2875,7 +2882,7 @@ else:
         self.assertIsNone(json.loads(state.read_text(encoding="utf-8"))["release"])
         self.assertEqual(
             self.sandbox.command(
-                ["/usr/bin/git", "tag", "--list", "v0.1.0"], cwd=candidate
+                ["/usr/bin/git", "tag", "--list", "v0.1.1"], cwd=candidate
             ).stdout.strip(),
             "",
         )
@@ -2886,7 +2893,7 @@ else:
                     f"--git-dir={self.sandbox.guest(remote)}",
                     "tag",
                     "--list",
-                    "v0.1.0",
+                    "v0.1.1",
                 ]
             ).stdout.strip(),
             "",
@@ -2909,9 +2916,9 @@ else:
         self.assertFalse(after_failure["release"]["isDraft"])
         self.assertEqual(
             self.sandbox.command(
-                ["/usr/bin/git", "tag", "--list", "v0.1.0"], cwd=candidate
+                ["/usr/bin/git", "tag", "--list", "v0.1.1"], cwd=candidate
             ).stdout.strip(),
-            "v0.1.0",
+            "v0.1.1",
         )
         self.assertEqual(
             self.sandbox.command(
@@ -2920,10 +2927,10 @@ else:
                     f"--git-dir={self.sandbox.guest(remote)}",
                     "tag",
                     "--list",
-                    "v0.1.0",
+                    "v0.1.1",
                 ]
             ).stdout.strip(),
-            "v0.1.0",
+            "v0.1.1",
         )
         calls_before_retry = len(after_failure["calls"])
 
@@ -2957,9 +2964,9 @@ else:
         self.assertFalse(mutated_release["isDraft"])
         self.assertEqual(
             self.sandbox.command(
-                ["/usr/bin/git", "tag", "--list", "v0.1.0"], cwd=mutated_candidate
+                ["/usr/bin/git", "tag", "--list", "v0.1.1"], cwd=mutated_candidate
             ).stdout.strip(),
-            "v0.1.0",
+            "v0.1.1",
         )
         self.assertEqual(
             self.sandbox.command(
@@ -2968,10 +2975,10 @@ else:
                     f"--git-dir={self.sandbox.guest(mutated_remote)}",
                     "tag",
                     "--list",
-                    "v0.1.0",
+                    "v0.1.1",
                 ]
             ).stdout.strip(),
-            "v0.1.0",
+            "v0.1.1",
         )
 
         create_candidate, create_output, create_remote, create_state, create_env = (
@@ -2990,7 +2997,7 @@ else:
                     f"--git-dir={self.sandbox.guest(create_remote)}",
                     "tag",
                     "--list",
-                    "v0.1.0",
+                    "v0.1.1",
                 ]
             ).stdout.strip(),
             "",
@@ -3064,7 +3071,7 @@ else:
                     f"--git-dir={self.sandbox.guest(draft_remote)}",
                     "tag",
                     "--list",
-                    "v0.1.0",
+                    "v0.1.1",
                 ]
             ).stdout.strip(),
             "",
@@ -3306,7 +3313,7 @@ else:
                 "user.email=test@example.invalid",
                 "tag",
                 "-a",
-                "v0.1.0",
+                "v0.1.1",
                 "-m",
                 "pre-existing",
             ],
@@ -3314,12 +3321,12 @@ else:
         )
         self.assertEqual(tagged.returncode, 0, tagged.stderr)
         pushed = self.sandbox.command(
-            ["/usr/bin/git", "push", "-q", "origin", "refs/tags/v0.1.0"],
+            ["/usr/bin/git", "push", "-q", "origin", "refs/tags/v0.1.1"],
             cwd=candidate,
         )
         self.assertEqual(pushed.returncode, 0, pushed.stderr)
         foreign = {
-            "tagName": "v0.1.0",
+            "tagName": "v0.1.1",
             "isDraft": True,
             "targetCommitish": head,
             "assets": [{"name": "foreign.bin", "size": 1, "digest": "sha256:00"}],
@@ -3329,14 +3336,14 @@ else:
             json.dumps({"release": foreign, "calls": []}) + "\n", encoding="utf-8"
         )
         before_tag = self.sandbox.command(
-            ["/usr/bin/git", "rev-parse", "v0.1.0^{tag}"], cwd=candidate
+            ["/usr/bin/git", "rev-parse", "v0.1.1^{tag}"], cwd=candidate
         ).stdout.strip()
         before_remote_tag = self.sandbox.command(
             [
                 "/usr/bin/git",
                 f"--git-dir={self.sandbox.guest(remote)}",
                 "rev-parse",
-                "refs/tags/v0.1.0^{tag}",
+                "refs/tags/v0.1.1^{tag}",
             ]
         ).stdout.strip()
         before_remote_object = self.sandbox.command(
@@ -3345,7 +3352,7 @@ else:
                 f"--git-dir={self.sandbox.guest(remote)}",
                 "cat-file",
                 "-p",
-                "refs/tags/v0.1.0",
+                "refs/tags/v0.1.1",
             ]
         ).stdout
 
@@ -3357,7 +3364,7 @@ else:
         )
         self.assertEqual(
             self.sandbox.command(
-                ["/usr/bin/git", "rev-parse", "v0.1.0^{tag}"], cwd=candidate
+                ["/usr/bin/git", "rev-parse", "v0.1.1^{tag}"], cwd=candidate
             ).stdout.strip(),
             before_tag,
         )
@@ -3367,7 +3374,7 @@ else:
                     "/usr/bin/git",
                     f"--git-dir={self.sandbox.guest(remote)}",
                     "rev-parse",
-                    "refs/tags/v0.1.0^{tag}",
+                    "refs/tags/v0.1.1^{tag}",
                 ]
             ).stdout.strip(),
             before_remote_tag,
@@ -3379,7 +3386,7 @@ else:
                     f"--git-dir={self.sandbox.guest(remote)}",
                     "cat-file",
                     "-p",
-                    "refs/tags/v0.1.0",
+                    "refs/tags/v0.1.1",
                 ]
             ).stdout,
             before_remote_object,
@@ -3400,11 +3407,11 @@ else:
             ["/usr/bin/git", "rev-parse", "HEAD"], cwd=success_candidate
         ).stdout.strip()
         tag_type = self.sandbox.command(
-            ["/usr/bin/git", "cat-file", "-t", "v0.1.0"], cwd=success_candidate
+            ["/usr/bin/git", "cat-file", "-t", "v0.1.1"], cwd=success_candidate
         )
         self.assertEqual(tag_type.stdout.strip(), "tag")
         local_tag_object = self.sandbox.command(
-            ["/usr/bin/git", "rev-parse", "v0.1.0^{tag}"], cwd=success_candidate
+            ["/usr/bin/git", "rev-parse", "v0.1.1^{tag}"], cwd=success_candidate
         ).stdout.strip()
         remote_tag_type = self.sandbox.command(
             [
@@ -3412,7 +3419,7 @@ else:
                 f"--git-dir={self.sandbox.guest(success_remote)}",
                 "cat-file",
                 "-t",
-                "refs/tags/v0.1.0",
+                "refs/tags/v0.1.1",
             ]
         ).stdout.strip()
         remote_tag_object = self.sandbox.command(
@@ -3420,14 +3427,14 @@ else:
                 "/usr/bin/git",
                 f"--git-dir={self.sandbox.guest(success_remote)}",
                 "rev-parse",
-                "refs/tags/v0.1.0^{tag}",
+                "refs/tags/v0.1.1^{tag}",
             ]
         ).stdout.strip()
         self.assertEqual(remote_tag_type, "tag")
         self.assertEqual(remote_tag_object, local_tag_object)
         self.assertEqual(
             self.sandbox.command(
-                ["/usr/bin/git", "rev-parse", "v0.1.0^{}"], cwd=success_candidate
+                ["/usr/bin/git", "rev-parse", "v0.1.1^{}"], cwd=success_candidate
             ).stdout.strip(),
             success_head,
         )
@@ -3437,7 +3444,7 @@ else:
                     "/usr/bin/git",
                     f"--git-dir={self.sandbox.guest(success_remote)}",
                     "rev-parse",
-                    "refs/tags/v0.1.0^{}",
+                    "refs/tags/v0.1.1^{}",
                 ]
             ).stdout.strip(),
             success_head,
@@ -3564,7 +3571,7 @@ else:
                 self.assertTrue("--list" in tag_args or "-l" in tag_args, argv)
         self.assertEqual(
             self.sandbox.command(
-                ["/usr/bin/git", "rev-parse", "v0.1.0^{tag}"],
+                ["/usr/bin/git", "rev-parse", "v0.1.1^{tag}"],
                 cwd=success_candidate,
             ).stdout.strip(),
             local_tag_object,
@@ -3575,7 +3582,7 @@ else:
                     "/usr/bin/git",
                     f"--git-dir={self.sandbox.guest(success_remote)}",
                     "rev-parse",
-                    "refs/tags/v0.1.0^{tag}",
+                    "refs/tags/v0.1.1^{tag}",
                 ]
             ).stdout.strip(),
             remote_tag_object,
@@ -3681,7 +3688,7 @@ else:
                 "user.email=test@example.invalid",
                 "tag",
                 "-a",
-                "v0.1.0",
+                "v0.1.1",
                 "HEAD^",
                 "-m",
                 "wrong target",
@@ -3690,12 +3697,12 @@ else:
         )
         self.assertEqual(created_old_tag.returncode, 0, created_old_tag.stderr)
         pushed_tag = self.sandbox.command(
-            ["/usr/bin/git", "push", "-q", "origin", "refs/tags/v0.1.0"],
+            ["/usr/bin/git", "push", "-q", "origin", "refs/tags/v0.1.1"],
             cwd=mismatch_candidate,
         )
         self.assertEqual(pushed_tag.returncode, 0, pushed_tag.stderr)
         old_target = self.sandbox.command(
-            ["/usr/bin/git", "rev-parse", "v0.1.0^{}"], cwd=mismatch_candidate
+            ["/usr/bin/git", "rev-parse", "v0.1.1^{}"], cwd=mismatch_candidate
         ).stdout.strip()
 
         mismatch = self._publish(mismatch_candidate, mismatch_output, mismatch_env)
@@ -3706,7 +3713,7 @@ else:
         )
         self.assertEqual(
             self.sandbox.command(
-                ["/usr/bin/git", "rev-parse", "v0.1.0^{}"], cwd=mismatch_candidate
+                ["/usr/bin/git", "rev-parse", "v0.1.1^{}"], cwd=mismatch_candidate
             ).stdout.strip(),
             old_target,
         )
@@ -3716,7 +3723,7 @@ else:
                     "/usr/bin/git",
                     f"--git-dir={self.sandbox.guest(mismatch_remote)}",
                     "rev-parse",
-                    "refs/tags/v0.1.0^{}",
+                    "refs/tags/v0.1.1^{}",
                 ]
             ).stdout.strip(),
             old_target,

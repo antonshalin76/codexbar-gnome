@@ -33,17 +33,17 @@ sh install.sh
 gtk-launch codexbar-gnome-indicator
 ```
 
-Release `0.1.0` contains these downloadable artifacts:
+Release `0.1.1` contains these downloadable artifacts:
 
-- `codexbar-gnome-0.1.0.tar.gz`
-- `codexbar-gnome-0.1.0.tar.gz.sha256`
+- `codexbar-gnome-0.1.1.tar.gz`
+- `codexbar-gnome-0.1.1.tar.gz.sha256`
 
 Verify and install a downloaded release:
 
 ```bash
-sha256sum -c codexbar-gnome-0.1.0.tar.gz.sha256
-tar -xzf codexbar-gnome-0.1.0.tar.gz
-cd codexbar-gnome-0.1.0
+sha256sum -c codexbar-gnome-0.1.1.tar.gz.sha256
+tar -xzf codexbar-gnome-0.1.1.tar.gz
+cd codexbar-gnome-0.1.1
 sh install.sh
 ```
 
@@ -183,11 +183,11 @@ Inspect the publication plan without creating a tag or GitHub resource:
 
 ```bash
 scripts/publish-release.sh --dry-run \
-  --archive dist/codexbar-gnome-0.1.0.tar.gz \
-  --checksum dist/codexbar-gnome-0.1.0.tar.gz.sha256
+  --archive dist/codexbar-gnome-0.1.1.tar.gz \
+  --checksum dist/codexbar-gnome-0.1.1.tar.gz.sha256
 ```
 
-Publication creates an annotated `v0.1.0` tag and a draft GitHub release,
+Publication creates an annotated `v0.1.1` tag and a draft GitHub release,
 uploads and verifies both artifacts, then publishes. A failure before
 publication rolls back only resources created by that invocation. A verified
 existing release is treated as an idempotent success; foreign or mismatched
