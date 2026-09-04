@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -1136,7 +1137,11 @@ class ProviderGatewayContractTests(_GatewayTestCase):
         gateway, _executor = self.gateway(payloads={"codex": payload})
         result = gateway.fetch("codex")
         self.assertIsInstance(result, indicator.RuntimeResult)
-        self.assertEqual(result.usage.primary.reset_text, "2030-01-01T00:00:00Z")
+        self.assertEqual(
+            result.usage.primary.reset_at,
+            datetime.fromisoformat("2030-01-01T00:00:00+00:00"),
+        )
+        self.assertIsNone(result.usage.primary.reset_text)
         self.assertEqual(
             [
                 (extra.slot, extra.provider_title, extra.window.percent)
@@ -1191,6 +1196,53 @@ class ProviderGatewayContractTests(_GatewayTestCase):
                 combined = combined_gateway.fetch("codex")
                 self.assert_runtime_failure(combined, "codex")
                 self.assertEqual(combined.kind, "schema")
+
+    def test_bdd_v07_absolute_reset_wins_over_description_for_every_provider(
+        self,
+    ) -> None:
+        resets_at = "2030-01-01T00:00:00Z"
+        expected = datetime.fromisoformat("2030-01-01T00:00:00+00:00")
+        window = {
+            "usedPercent": 1,
+            "windowMinutes": 300,
+            "resetsAt": resets_at,
+            "resetDescription": "provider-specific wording",
+        }
+        for runtime in ("codex", "grok", "claude"):
+            with self.subTest(runtime=runtime):
+                gateway, _executor = self.gateway(
+                    payloads={
+                        runtime: [{"provider": runtime, "usage": {"primary": window}}]
+                    }
+                )
+                result = gateway.fetch(runtime)
+                self.assertIsInstance(result, indicator.RuntimeResult)
+                self.assertEqual(result.usage.primary.reset_at, expected)
+                rendered = indicator._format_reset(
+                    result.usage.primary,
+                    now=datetime.fromisoformat("2029-12-30T00:00:00+00:00"),
+                )
+                self.assertEqual(rendered, "Jan 1 at 12:00\u202fAM")
+                self.assertNotEqual(rendered, "provider-specific wording")
+
+        self.write_claude_settings(
+            {
+                "ANTHROPIC_BASE_URL": "https://api.z.ai",
+                "ANTHROPIC_AUTH_TOKEN": "ZAI-MARKER",
+            },
+        )
+        gateway, _executor = self.gateway(
+            payloads={"zai": [{"provider": "zai", "usage": {"primary": window}}]}
+        )
+        result = gateway.fetch("claude")
+        self.assertIsInstance(result, indicator.RuntimeResult)
+        self.assertEqual(result.usage.primary.reset_at, expected)
+        rendered = indicator._format_reset(
+            result.usage.primary,
+            now=datetime.fromisoformat("2029-12-30T00:00:00+00:00"),
+        )
+        self.assertEqual(rendered, "Jan 1 at 12:00\u202fAM")
+        self.assertNotEqual(rendered, "provider-specific wording")
 
     def test_bdd_p06_supported_strings_are_redacted_and_bounded(self) -> None:
         marker = "SECRET-MARKER"
@@ -2255,12 +2307,13 @@ class ZaiRoutingContractTests(_GatewayTestCase):
             minutes=300,
             reset="5 hours window",
         )
-        self.assert_window(
-            result.usage.secondary,
-            percent=73,
-            minutes=10080,
-            reset="2030-01-02T03:04:05Z",
+        self.assertEqual(result.usage.secondary.percent, 73)
+        self.assertEqual(result.usage.secondary.window_minutes, 10080)
+        self.assertEqual(
+            result.usage.secondary.reset_at,
+            datetime.fromisoformat("2030-01-02T03:04:05+00:00"),
         )
+        self.assertIsNone(result.usage.secondary.reset_text)
 
     def test_bdd_z09_mcp_and_unrecognized_windows_do_not_cross_gateway(self) -> None:
         self.write_claude_settings(

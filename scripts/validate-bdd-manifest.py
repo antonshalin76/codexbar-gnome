@@ -60,6 +60,7 @@ DETERMINISTIC = {
     "BDD-V04",
     "BDD-V05",
     "BDD-V06",
+    "BDD-V07",
     "BDD-L01",
     "BDD-L02",
     "BDD-L03",

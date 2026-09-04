@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 - 2026-09-05
+
+- Normalized quota-reset timestamps for Codex, Grok, Claude, and Claude/Z.AI in one local-time Codex-style format.
+- Preserved provider reset descriptions only when no authoritative timestamp is available.
+- Added deterministic coverage for timezone offsets, local date boundaries, DST, malformed timestamps, and every displayed quota slot.
+
 ## 0.1.1 - 2026-09-04
 
 - Made GitHub release verification robust when asset digests are temporarily or permanently unavailable.

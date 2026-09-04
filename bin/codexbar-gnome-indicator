@@ -460,6 +460,7 @@ class UsageWindow:
     percent: int
     window_minutes: int | None = None
     reset_text: object | None = None
+    reset_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -1124,8 +1125,6 @@ def _normalized_percent(value: object) -> int:
 def _parse_window(
     raw: object,
     sensitive_values: tuple[str, ...] = (),
-    *,
-    prefer_resets_at: bool = False,
 ) -> UsageWindow:
     if not isinstance(raw, dict):
         raise ProcessFailure("schema", "usage window must be an object")
@@ -1143,7 +1142,7 @@ def _parse_window(
     resets_at = raw.get("resetsAt")
     if "resetsAt" in raw and not isinstance(resets_at, str):
         raise ProcessFailure("schema", "resetsAt must be an ISO-8601 timestamp")
-    parsed_reset: str | None = None
+    parsed_reset_at: datetime | None = None
     if "resetsAt" in raw:
         if not resets_at or len(resets_at) > 128:
             raise ProcessFailure("schema", "resetsAt must be an ISO-8601 timestamp")
@@ -1156,14 +1155,19 @@ def _parse_window(
             ) from exc
         if parsed_reset_at.tzinfo is None:
             raise ProcessFailure("schema", "resetsAt must include a timezone")
-        parsed_reset = sanitize_diagnostic(resets_at, sensitive_values)
-    if prefer_resets_at and parsed_reset is not None:
-        reset = parsed_reset
-    elif isinstance(reset_description, str) and reset_description:
-        reset = sanitize_diagnostic(reset_description, sensitive_values)
-    else:
-        reset = parsed_reset
-    return UsageWindow(percent, minutes, reset)
+    reset_text = (
+        sanitize_diagnostic(reset_description, sensitive_values)
+        if parsed_reset_at is None
+        and isinstance(reset_description, str)
+        and reset_description
+        else None
+    )
+    return UsageWindow(
+        percent,
+        minutes,
+        reset_text=reset_text,
+        reset_at=parsed_reset_at,
+    )
 
 
 def _is_zai_origin(value: object) -> bool:
@@ -1412,9 +1416,7 @@ class ProviderGateway:
                 raise ProcessFailure("schema", "windowMinutes must be an integer")
             if minutes not in (300, 10080):
                 continue
-            candidates.append(
-                _parse_window(raw, sensitive_values, prefer_resets_at=True)
-            )
+            candidates.append(_parse_window(raw, sensitive_values))
         raw_extras = usage_raw.get("extraRateWindows", [])
         if not isinstance(raw_extras, list):
             raise ProcessFailure("schema", "extraRateWindows must be an array")
@@ -1430,9 +1432,7 @@ class ProviderGateway:
             if isinstance(minutes, bool) or not isinstance(minutes, int):
                 raise ProcessFailure("schema", "windowMinutes must be an integer")
             if minutes in (300, 10080):
-                candidates.append(
-                    _parse_window(raw, sensitive_values, prefer_resets_at=True)
-                )
+                candidates.append(_parse_window(raw, sensitive_values))
         horizons: dict[int, UsageWindow] = {}
         for window in candidates:
             assert window.window_minutes is not None
@@ -2063,6 +2063,66 @@ def _bar(percent: int) -> str:
     return "█" * filled + "░" * (10 - filled)
 
 
+_MONTH_ABBREVIATIONS = (
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
+
+
+def _is_aware_datetime(value: object) -> bool:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return False
+    try:
+        return value.utcoffset() is not None
+    except Exception:  # noqa: BLE001 - malformed internal display value fails closed
+        return False
+
+
+def _format_reset(window: UsageWindow, *, now: datetime | None = None) -> str | None:
+    reset_at = window.reset_at
+    if reset_at is None:
+        return (
+            window.reset_text
+            if isinstance(window.reset_text, str) and window.reset_text
+            else None
+        )
+    if not _is_aware_datetime(reset_at):
+        return None
+
+    local_now = now if now is not None else datetime.now().astimezone()
+    if not _is_aware_datetime(local_now):
+        return None
+    try:
+        local_reset = (
+            reset_at.astimezone(local_now.tzinfo)
+            if now is not None
+            else reset_at.astimezone()
+        )
+    except Exception:  # noqa: BLE001 - malformed internal display value fails closed
+        return None
+
+    hour = local_reset.hour % 12 or 12
+    period = "AM" if local_reset.hour < 12 else "PM"
+    time_text = f"{hour}:{local_reset.minute:02d}\u202f{period}"
+    days_until_reset = (local_reset.date() - local_now.date()).days
+    if days_until_reset == 0:
+        return time_text
+    if days_until_reset == 1:
+        return f"tomorrow, {time_text}"
+    month = _MONTH_ABBREVIATIONS[local_reset.month - 1]
+    return f"{month} {local_reset.day} at {time_text}"
+
+
 def _percent(window: UsageWindow | None) -> str:
     return "--" if window is None else f"{window.percent}%"
 
@@ -2163,7 +2223,9 @@ class IndicatorView:
             complete(None)
 
     @staticmethod
-    def _normal_rows(runtime: RuntimeSnapshot) -> list[str]:
+    def _normal_rows(
+        runtime: RuntimeSnapshot, *, now: datetime | None = None
+    ) -> list[str]:
         if runtime.usage is None:
             return []
         windows: list[tuple[str, UsageWindow]] = []
@@ -2190,11 +2252,8 @@ class IndicatorView:
             windows.append((f"{RUNTIME_LABELS[runtime.runtime]} {title}", extra.window))
         rows = []
         for name, window in windows:
-            reset = (
-                f" · resets {window.reset_text}"
-                if isinstance(window.reset_text, str) and window.reset_text
-                else ""
-            )
+            reset_text = _format_reset(window, now=now)
+            reset = f" · resets {reset_text}" if reset_text is not None else ""
             percent_text = f"{window.percent}%"
             row = f"{_bar(window.percent)}  {percent_text:>4}  {name}{reset}"
             rows.append(

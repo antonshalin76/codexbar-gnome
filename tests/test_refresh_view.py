@@ -13,8 +13,10 @@ import threading
 import time
 import unittest
 from collections import Counter, deque
+from datetime import datetime, tzinfo
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from tests.support import MODULE_PATH, load_indicator
 
@@ -2155,6 +2157,172 @@ class IndicatorViewRedTests(unittest.TestCase):
         callback_ran = threading.Event()
         indicator.GLib.idle_add(callback_ran.set)
         _pump_gtk_until(callback_ran)
+
+    def test_bdd_v07_reset_formatter_matches_codex_style_at_time_boundaries(
+        self,
+    ) -> None:
+        irkutsk = ZoneInfo("Asia/Irkutsk")
+        new_york = ZoneInfo("America/New_York")
+        cases = (
+            (
+                "same local day",
+                datetime.fromisoformat("2026-09-11T08:58:00+00:00"),
+                datetime(2026, 9, 11, 12, 0, tzinfo=irkutsk),
+                "4:58\u202fPM",
+            ),
+            (
+                "equivalent source offset",
+                datetime.fromisoformat("2026-09-11T14:58:00+06:00"),
+                datetime(2026, 9, 11, 12, 0, tzinfo=irkutsk),
+                "4:58\u202fPM",
+            ),
+            (
+                "tomorrow after local conversion",
+                datetime.fromisoformat("2026-09-04T20:28:00+00:00"),
+                datetime(2026, 9, 4, 23, 30, tzinfo=irkutsk),
+                "tomorrow, 4:28\u202fAM",
+            ),
+            (
+                "later date",
+                datetime.fromisoformat("2026-09-11T08:58:00+00:00"),
+                datetime(2026, 9, 4, 12, 0, tzinfo=irkutsk),
+                "Sep 11 at 4:58\u202fPM",
+            ),
+            (
+                "tomorrow across year boundary",
+                datetime.fromisoformat("2026-12-31T16:10:00+00:00"),
+                datetime(2026, 12, 31, 23, 50, tzinfo=irkutsk),
+                "tomorrow, 12:10\u202fAM",
+            ),
+            (
+                "later date across year boundary",
+                datetime.fromisoformat("2027-01-01T16:15:00+00:00"),
+                datetime(2026, 12, 31, 12, 0, tzinfo=irkutsk),
+                "Jan 2 at 12:15\u202fAM",
+            ),
+            (
+                "DST transition",
+                datetime.fromisoformat("2026-03-08T07:30:00+00:00"),
+                datetime(2026, 3, 8, 0, 30, tzinfo=new_york),
+                "3:30\u202fAM",
+            ),
+            (
+                "noon",
+                datetime.fromisoformat("2026-09-11T04:00:00+00:00"),
+                datetime(2026, 9, 11, 9, 0, tzinfo=irkutsk),
+                "12:00\u202fPM",
+            ),
+        )
+        for name, reset_at, now, expected in cases:
+            with self.subTest(name=name):
+                window = indicator.UsageWindow(percent=1, reset_at=reset_at)
+                self.assertEqual(indicator._format_reset(window, now=now), expected)
+
+        self.assertEqual(
+            indicator._format_reset(
+                indicator.UsageWindow(percent=1, reset_text="5 hours window"),
+                now=datetime(2026, 9, 4, 12, 0, tzinfo=irkutsk),
+            ),
+            "5 hours window",
+        )
+        self.assertIsNone(
+            indicator._format_reset(
+                indicator.UsageWindow(
+                    percent=1,
+                    reset_at="2030-01-01T00:00:00Z",
+                ),
+                now=datetime(2026, 9, 4, 12, 0, tzinfo=irkutsk),
+            )
+        )
+
+        class MissingOffset(tzinfo):
+            def utcoffset(self, value: datetime | None) -> None:
+                return None
+
+        class RaisingOffset(tzinfo):
+            def utcoffset(self, value: datetime | None) -> None:
+                raise RuntimeError("malformed timezone")
+
+        malformed_datetimes = (
+            datetime(2030, 1, 1, tzinfo=None),  # noqa: DTZ001 - malformed fixture
+            datetime(2030, 1, 1, tzinfo=MissingOffset()),
+            datetime(2030, 1, 1, tzinfo=RaisingOffset()),
+        )
+        for malformed in malformed_datetimes:
+            with self.subTest(malformed=repr(malformed)):
+                self.assertIsNone(
+                    indicator._format_reset(
+                        indicator.UsageWindow(
+                            percent=1,
+                            reset_text="must not mask malformed typed state",
+                            reset_at=malformed,
+                        ),
+                        now=datetime(2026, 9, 4, 12, 0, tzinfo=irkutsk),
+                    )
+                )
+
+        for malformed_now in (
+            datetime(2026, 9, 4, 12, 0, tzinfo=MissingOffset()),
+            datetime(2026, 9, 4, 12, 0, tzinfo=RaisingOffset()),
+        ):
+            self.assertIsNone(
+                indicator._format_reset(
+                    indicator.UsageWindow(
+                        percent=1,
+                        reset_at=datetime.fromisoformat("2030-01-01T00:00:00+00:00"),
+                    ),
+                    now=malformed_now,
+                )
+            )
+
+    def test_bdd_v07_every_displayed_harness_slot_uses_one_reset_projection(
+        self,
+    ) -> None:
+        now = datetime(2026, 9, 4, 12, 0, tzinfo=ZoneInfo("Asia/Irkutsk"))
+        reset_at = datetime.fromisoformat("2026-09-11T08:58:00+00:00")
+
+        def window(percent: int) -> object:
+            return indicator.UsageWindow(percent=percent, reset_at=reset_at)
+
+        snapshots = (
+            _runtime_snapshot(
+                "codex",
+                "good",
+                usage=indicator.Usage(
+                    secondary=window(10),
+                    extras=(indicator.UsageExtra(window=window(11)),),
+                ),
+            ),
+            _runtime_snapshot(
+                "grok",
+                "good",
+                usage=indicator.Usage(
+                    primary=window(20),
+                    secondary=window(21),
+                    extras=(indicator.UsageExtra(window=window(22)),),
+                ),
+            ),
+            _runtime_snapshot(
+                "claude",
+                "good",
+                source="zai",
+                usage=indicator.Usage(
+                    primary=window(30),
+                    secondary=window(31),
+                    extras=(indicator.UsageExtra(window=window(32)),),
+                ),
+            ),
+        )
+        rows = [
+            row
+            for runtime in snapshots
+            for row in indicator.IndicatorView._normal_rows(runtime, now=now)
+        ]
+
+        self.assertEqual(len(rows), 8)
+        self.assertTrue(
+            all(row.endswith(" · resets Sep 11 at 4:58\u202fPM") for row in rows)
+        )
 
     def test_bdd_v05_details_dialog_is_native_nonmodal_and_main_loop_remains_live(
         self,
