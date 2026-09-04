@@ -954,6 +954,28 @@ class ProviderGatewayContractTests(_GatewayTestCase):
         self.assertNotIn("accountEmail", repr(result))
         self.assertNotIn("must-not-cross", repr(result))
 
+    def test_bdd_p04_null_window_slots_are_absent(self) -> None:
+        payload = [
+            {
+                "provider": "codex",
+                "usage": {
+                    "primary": None,
+                    "secondary": {"usedPercent": 42, "windowMinutes": 10080},
+                    "tertiary": None,
+                },
+            }
+        ]
+        gateway, _executor = self.gateway(payloads={"codex": payload})
+
+        result = gateway.fetch("codex")
+
+        self.assertIsInstance(result, indicator.RuntimeResult)
+        self.assertIsNone(result.usage.primary)
+        self.assert_window(
+            result.usage.secondary, percent=42, minutes=10080, reset=None
+        )
+        self.assertEqual(result.usage.extras, ())
+
     def test_bdd_p05_executor_failure_never_accepts_stdout_as_success(self) -> None:
         failure = indicator.ProcessFailure(
             kind="exit",
@@ -2079,6 +2101,36 @@ class ZaiRoutingContractTests(_GatewayTestCase):
                     else "schema"
                 )
                 self.assertEqual(result.kind, expected_kind)
+
+    def test_bdd_z07_null_window_slots_are_absent(self) -> None:
+        self.write_claude_settings(
+            {
+                "ANTHROPIC_BASE_URL": "https://api.z.ai",
+                "ANTHROPIC_AUTH_TOKEN": "ZAI-MARKER",
+            },
+        )
+        payload = [
+            {
+                "provider": "zai",
+                "usage": {
+                    "primary": None,
+                    "secondary": {
+                        "usedPercent": 73,
+                        "windowMinutes": 10080,
+                    },
+                    "tertiary": None,
+                },
+            }
+        ]
+        gateway, _executor = self.gateway(payloads={"zai": payload})
+
+        result = gateway.fetch("claude")
+
+        self.assertIsInstance(result, indicator.RuntimeResult)
+        self.assertIsNone(result.usage.primary)
+        self.assert_window(
+            result.usage.secondary, percent=73, minutes=10080, reset=None
+        )
 
     def test_bdd_z07_deduplicates_identical_horizon_and_rejects_conflicts(self) -> None:
         self.write_claude_settings(

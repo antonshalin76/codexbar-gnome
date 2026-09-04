@@ -1342,16 +1342,16 @@ class ProviderGateway:
     ) -> Usage:
         primary = (
             _parse_window(usage_raw["primary"], sensitive_values)
-            if "primary" in usage_raw
+            if usage_raw.get("primary") is not None
             else None
         )
         secondary = (
             _parse_window(usage_raw["secondary"], sensitive_values)
-            if "secondary" in usage_raw
+            if usage_raw.get("secondary") is not None
             else None
         )
         extras: list[UsageExtra] = []
-        if "tertiary" in usage_raw:
+        if usage_raw.get("tertiary") is not None:
             extras.append(
                 UsageExtra(
                     _parse_window(usage_raw["tertiary"], sensitive_values),
@@ -1394,6 +1394,8 @@ class ProviderGateway:
             if key not in usage_raw:
                 continue
             raw = usage_raw[key]
+            if raw is None:
+                continue
             if not isinstance(raw, dict):
                 raise ProcessFailure("schema", "Z.AI usage window must be an object")
             if "windowMinutes" not in raw:
