@@ -495,7 +495,7 @@ def validate_release(value: dict[str, object], *, draft: bool) -> None:
     assets = value.get("assets")
     if not isinstance(assets, list) or len(assets) != len(asset_contract):
         raise PublishError("GitHub release assets do not match")
-    observed: dict[str, tuple[int, str]] = {}
+    observed: dict[str, int] = {}
     for item in assets:
         if not isinstance(item, dict):
             raise PublishError("GitHub release assets do not match")
@@ -506,15 +506,44 @@ def validate_release(value: dict[str, object], *, draft: bool) -> None:
             not isinstance(name, str)
             or type(size) is not int
             or size < 0
-            or not isinstance(digest, str)
-            or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+            or (
+                digest is not None
+                and (
+                    not isinstance(digest, str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+                )
+            )
         ):
             raise PublishError("GitHub release assets do not match")
         if name in observed:
             raise PublishError("GitHub release contains duplicate assets")
-        observed[name] = (size, digest)
-    if observed != asset_contract:
+        expected = asset_contract.get(name)
+        if expected is None or size != expected[0]:
+            raise PublishError("GitHub release asset digest or size does not match")
+        if digest is not None and digest != expected[1]:
+            raise PublishError("GitHub release asset digest or size does not match")
+        observed[name] = size
+    if set(observed) != set(asset_contract):
         raise PublishError("GitHub release asset digest or size does not match")
+
+
+def verify_release_asset_bytes() -> None:
+    with tempfile.TemporaryDirectory(prefix="codexbar-release-readback-") as raw_dir:
+        directory = Path(raw_dir)
+        downloaded = gh("release", "download", tag, "--dir", str(directory), check=False)
+        if downloaded.returncode != 0:
+            raise PublishError("GitHub release assets are not ready for download")
+        entries = list(directory.iterdir())
+        if {entry.name for entry in entries} != set(asset_contract):
+            raise PublishError("GitHub release downloaded assets do not match")
+        for entry in entries:
+            expected_size, expected_digest = asset_contract[entry.name]
+            if not regular(entry):
+                raise PublishError("GitHub release downloaded asset is unsafe")
+            if entry.stat().st_size != expected_size:
+                raise PublishError("GitHub release downloaded asset size does not match")
+            if f"sha256:{sha256(entry)}" != expected_digest:
+                raise PublishError("GitHub release downloaded asset digest does not match")
 
 
 def wait_for_owned_release_assets(*, draft: bool) -> dict[str, object]:
@@ -525,6 +554,7 @@ def wait_for_owned_release_assets(*, draft: bool) -> dict[str, object]:
             raise PublishError("owned GitHub release disappeared during verification")
         try:
             validate_release(value, draft=draft)
+            verify_release_asset_bytes()
             return value
         except PublishError as error:
             if not str(error).startswith("GitHub release asset"):
@@ -548,6 +578,7 @@ try:
     if existing_release is not None:
         if existing_release.get("isDraft") is True:
             validate_release(existing_release, draft=True)
+            verify_release_asset_bytes()
             if read_publication_marker() is None:
                 raise PublishError("pre-existing draft is not owned by this transaction")
             resume_draft = True
@@ -556,6 +587,7 @@ try:
             created_release = True
         else:
             validate_release(existing_release, draft=False)
+            verify_release_asset_bytes()
             if read_publication_marker() is not None:
                 remove_publication_marker()
             write_external_evidence("BDD-Q04B")
@@ -692,6 +724,7 @@ try:
         raise PublishError("publication result is ambiguous; retry to reconcile")
     published = True
     validate_release(published_release, draft=False)
+    verify_release_asset_bytes()
     fail_at("published")
     write_external_evidence("BDD-Q04B")
     remove_publication_marker()

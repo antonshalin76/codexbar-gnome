@@ -1721,6 +1721,7 @@ try:
     responsive_after_details = has_owner(
         connection, "io.github.antonshalin76.CodexBarGnome"
     )
+    (probe / "observer-complete").touch()
     call(
         connection, service, menu_path, "com.canonical.dbusmenu", "Event",
         GLib.Variant(
@@ -1732,7 +1733,6 @@ try:
         lambda: not has_owner(connection, "io.github.antonshalin76.CodexBarGnome"),
         "owner release",
     )
-    (probe / "observer-complete").touch()
     stdout, stderr = process.communicate(timeout=12)
     value = {
         "owner": owner,
@@ -2219,7 +2219,7 @@ if args[:2] == ["release", "view"]:
     if state["release"] is None:
         save()
         raise SystemExit(1)
-    release = state["release"]
+    release = json.loads(json.dumps(state["release"]))
     delayed_views = int(os.environ.get("FAKE_GH_DELAY_ASSET_DIGEST_VIEWS", "0"))
     if release["assets"]:
         state["assetViewCount"] = state.get("assetViewCount", 0) + 1
@@ -2227,6 +2227,8 @@ if args[:2] == ["release", "view"]:
             release = json.loads(json.dumps(release))
             for asset in release["assets"]:
                 asset["digest"] = None
+        for asset in release["assets"]:
+            asset.pop("contentHex", None)
     save()
     print(json.dumps(release, sort_keys=True))
 elif args[:2] == ["release", "create"]:
@@ -2258,9 +2260,31 @@ elif args[:2] == ["release", "upload"]:
             "name": asset_path.name,
             "size": len(payload),
             "digest": "sha256:" + hashlib.sha256(payload).hexdigest(),
+            "contentHex": payload.hex(),
         })
     save()
     fail_after_mutation()
+elif args[:2] == ["release", "download"]:
+    release = state["release"]
+    if release is None:
+        save()
+        raise SystemExit(66)
+    state["assetDownloadCount"] = state.get("assetDownloadCount", 0) + 1
+    delayed_downloads = int(
+        os.environ.get("FAKE_GH_DELAY_ASSET_DOWNLOADS", "0")
+    )
+    if state["assetDownloadCount"] <= delayed_downloads:
+        save()
+        raise SystemExit(69)
+    destination = pathlib.Path(args[args.index("--dir") + 1])
+    destination.mkdir(parents=True, exist_ok=True)
+    for asset in release["assets"]:
+        content = asset.get("contentHex")
+        if not isinstance(content, str):
+            save()
+            raise SystemExit(70)
+        (destination / asset["name"]).write_bytes(bytes.fromhex(content))
+    save()
 elif args[:2] == ["release", "delete"]:
     state["release"] = None
     save()
@@ -2904,7 +2928,7 @@ else:
         retry_calls = after_retry["calls"][calls_before_retry:]
         self.assertEqual(
             [call[:2] for call in retry_calls],
-            [["repo", "view"], ["release", "view"]],
+            [["repo", "view"], ["release", "view"], ["release", "download"]],
         )
 
         (
@@ -3287,6 +3311,7 @@ else:
             success_env,
         ) = self._publication_fixture("publish-success")
         success_env["FAKE_GH_DELAY_ASSET_DIGEST_VIEWS"] = "2"
+        success_env["FAKE_GH_DELAY_ASSET_DOWNLOADS"] = "2"
         first = self._publish(success_candidate, success_output, success_env)
         self.assertEqual(first.returncode, 0, first.stderr)
         success_head = self.sandbox.command(
@@ -3401,7 +3426,21 @@ else:
         )
         self.assertTrue(
             any(
+                call[:2] == ["release", "download"]
+                for call in publication_calls[checksum_upload_index + 1 : publish_index]
+            ),
+            publication_calls,
+        )
+        self.assertTrue(
+            any(
                 call[:2] == ["release", "view"]
+                for call in publication_calls[publish_index + 1 :]
+            ),
+            publication_calls,
+        )
+        self.assertTrue(
+            any(
+                call[:2] == ["release", "download"]
                 for call in publication_calls[publish_index + 1 :]
             ),
             publication_calls,
@@ -3426,7 +3465,8 @@ else:
         self.assertTrue(retry_calls)
         self.assertTrue(
             all(
-                call[:2] in (["repo", "view"], ["release", "view"])
+                call[:2]
+                in (["repo", "view"], ["release", "view"], ["release", "download"])
                 for call in retry_calls
             ),
             retry_calls,
