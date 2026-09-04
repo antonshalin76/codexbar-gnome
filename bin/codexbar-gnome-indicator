@@ -1121,7 +1121,12 @@ def _normalized_percent(value: object) -> int:
     return max(0, min(100, rounded))
 
 
-def _parse_window(raw: object, sensitive_values: tuple[str, ...] = ()) -> UsageWindow:
+def _parse_window(
+    raw: object,
+    sensitive_values: tuple[str, ...] = (),
+    *,
+    prefer_resets_at: bool = False,
+) -> UsageWindow:
     if not isinstance(raw, dict):
         raise ProcessFailure("schema", "usage window must be an object")
     if "usedPercent" not in raw:
@@ -1152,7 +1157,9 @@ def _parse_window(raw: object, sensitive_values: tuple[str, ...] = ()) -> UsageW
         if parsed_reset_at.tzinfo is None:
             raise ProcessFailure("schema", "resetsAt must include a timezone")
         parsed_reset = sanitize_diagnostic(resets_at, sensitive_values)
-    if isinstance(reset_description, str) and reset_description:
+    if prefer_resets_at and parsed_reset is not None:
+        reset = parsed_reset
+    elif isinstance(reset_description, str) and reset_description:
         reset = sanitize_diagnostic(reset_description, sensitive_values)
     else:
         reset = parsed_reset
@@ -1405,7 +1412,9 @@ class ProviderGateway:
                 raise ProcessFailure("schema", "windowMinutes must be an integer")
             if minutes not in (300, 10080):
                 continue
-            candidates.append(_parse_window(raw, sensitive_values))
+            candidates.append(
+                _parse_window(raw, sensitive_values, prefer_resets_at=True)
+            )
         raw_extras = usage_raw.get("extraRateWindows", [])
         if not isinstance(raw_extras, list):
             raise ProcessFailure("schema", "extraRateWindows must be an array")
@@ -1421,7 +1430,9 @@ class ProviderGateway:
             if isinstance(minutes, bool) or not isinstance(minutes, int):
                 raise ProcessFailure("schema", "windowMinutes must be an integer")
             if minutes in (300, 10080):
-                candidates.append(_parse_window(raw, sensitive_values))
+                candidates.append(
+                    _parse_window(raw, sensitive_values, prefer_resets_at=True)
+                )
         horizons: dict[int, UsageWindow] = {}
         for window in candidates:
             assert window.window_minutes is not None

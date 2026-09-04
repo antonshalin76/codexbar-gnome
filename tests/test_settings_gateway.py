@@ -2219,6 +2219,49 @@ class ZaiRoutingContractTests(_GatewayTestCase):
         self.assert_window(result.usage.primary, percent=42, minutes=300, reset=None)
         self.assertIsNone(result.usage.secondary)
 
+    def test_bdd_z08_zai_prefers_authoritative_reset_timestamp(self) -> None:
+        self.write_claude_settings(
+            {
+                "ANTHROPIC_BASE_URL": "https://api.z.ai",
+                "ANTHROPIC_AUTH_TOKEN": "ZAI-MARKER",
+            },
+        )
+        payload = [
+            {
+                "provider": "zai",
+                "usage": {
+                    "primary": {
+                        "usedPercent": 42,
+                        "windowMinutes": 300,
+                        "resetDescription": "5 hours window",
+                    },
+                    "secondary": {
+                        "usedPercent": 73,
+                        "windowMinutes": 10080,
+                        "resetDescription": "1 week window",
+                        "resetsAt": "2030-01-02T03:04:05Z",
+                    },
+                },
+            },
+        ]
+        gateway, _executor = self.gateway(payloads={"zai": payload})
+
+        result = gateway.fetch("claude")
+
+        self.assertIsInstance(result, indicator.RuntimeResult)
+        self.assert_window(
+            result.usage.primary,
+            percent=42,
+            minutes=300,
+            reset="5 hours window",
+        )
+        self.assert_window(
+            result.usage.secondary,
+            percent=73,
+            minutes=10080,
+            reset="2030-01-02T03:04:05Z",
+        )
+
     def test_bdd_z09_mcp_and_unrecognized_windows_do_not_cross_gateway(self) -> None:
         self.write_claude_settings(
             {
