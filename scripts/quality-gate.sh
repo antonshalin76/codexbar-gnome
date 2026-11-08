@@ -36,8 +36,24 @@ fi
 mkdir -p "$(dirname -- "$report_path")"
 command_log=$(mktemp)
 test_report=$(mktemp)
+# Private runtime directory keeps the isolated test bus away from host portals,
+# keyring and FUSE mounts under the desktop session's XDG_RUNTIME_DIR.
+gate_runtime=$(mktemp -d)
+chmod 0700 "$gate_runtime"
 release_commit=$(git rev-parse HEAD 2>/dev/null || true)
-trap 'rm -f "$command_log" "$test_report"' EXIT
+cleanup_gate() {
+    local mountpoint
+    for mountpoint in "$gate_runtime/doc" "$gate_runtime/gvfs"; do
+        if mountpoint -q "$mountpoint" 2>/dev/null; then
+            fusermount3 -u -z "$mountpoint" ||
+                echo "quality-gate: warning: cannot unmount $mountpoint" >&2
+        fi
+    done
+    rm -f "$command_log" "$test_report"
+    rm -rf "$gate_runtime" ||
+        echo "quality-gate: warning: cannot remove $gate_runtime" >&2
+}
+trap cleanup_gate EXIT
 
 render_report() {
     local status=$1
@@ -174,6 +190,7 @@ run_gate shellcheck shellcheck \
 
 run_gate unit-e2e-tests env \
     CODEXBAR_GATE_REPORT="$report_path" \
+    XDG_RUNTIME_DIR="$gate_runtime" \
     dbus-run-session -- xvfb-run -a \
     python3 scripts/run-tests.py --report "$test_report"
 run_gate bdd-manifest python3 scripts/validate-bdd-manifest.py \

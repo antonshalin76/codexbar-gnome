@@ -26,6 +26,7 @@ DEFAULT_SETTINGS = {
         "codex": {"poll": True, "autoRefresh": True},
         "grok": {"poll": True, "autoRefresh": True},
         "claude": {"poll": False, "autoRefresh": False},
+        "antigravity": {"poll": False, "autoRefresh": False},
     },
 }
 FAIL_CLOSED_SETTINGS = {
@@ -33,6 +34,7 @@ FAIL_CLOSED_SETTINGS = {
         "codex": {"poll": False, "autoRefresh": False},
         "grok": {"poll": False, "autoRefresh": False},
         "claude": {"poll": False, "autoRefresh": False},
+        "antigravity": {"poll": False, "autoRefresh": False},
     },
 }
 
@@ -60,7 +62,7 @@ with open(os.environ["CODEXBAR_FAKE_LEDGER"], "a", encoding="utf-8") as stream:
     stream.write(json.dumps(args) + "\\n")
 
 if args == ["usage", "--help"]:
-    print("--provider codex|grok|claude|zai --json-only --no-color")
+    print("--provider codex|grok|claude|antigravity|zai --json-only --no-color")
     raise SystemExit(0)
 
 allowed = {
@@ -68,6 +70,16 @@ allowed = {
     ("usage", "--provider", "codex", "--json-only", "--no-color", "--source", "oauth"),
     ("usage", "--provider", "grok", "--json-only", "--no-color", "--source", "auto"),
     ("usage", "--provider", "claude", "--json-only", "--no-color", "--source", "oauth"),
+    ("usage", "--provider", "antigravity", "--json-only", "--no-color"),
+    (
+        "usage",
+        "--provider",
+        "antigravity",
+        "--json-only",
+        "--no-color",
+        "--source",
+        "oauth",
+    ),
     ("usage", "--provider", "zai", "--json-only", "--no-color"),
 }
 if tuple(args) not in allowed:
@@ -88,7 +100,9 @@ print(json.dumps([{
 class RecordingExecutor:
     """Strict executor double that never records credential values."""
 
-    HELP = b"usage --provider {codex,grok,claude,zai} --json-only --no-color\n"
+    HELP = (
+        b"usage --provider {codex,grok,claude,antigravity,zai} --json-only --no-color\n"
+    )
 
     def __init__(
         self,
@@ -210,6 +224,7 @@ class SettingsStoreContractTests(unittest.TestCase):
                     "codex": {"poll": True, "autoRefresh": False},
                     "grok": {"poll": True, "autoRefresh": True},
                     "claude": {"poll": True, "autoRefresh": False},
+                    "antigravity": {"poll": False, "autoRefresh": False},
                 },
             },
         )
@@ -706,17 +721,18 @@ class ProviderGatewayContractTests(_GatewayTestCase):
 
     def test_bdd_p03_capability_probe_fails_closed_and_caches_failure(self) -> None:
         invalid_help = (
-            b"--json-only codex grok claude",
-            b"--provider codex grok claude zai",
-            b"--json-only --provider codex grok claude za1",
-            b"--json-only --provider codex grok claude zai-lookalike",
-            b"--json-only --provider codex grok claude zai=false",
-            b"--json-only-legacy --provider codex grok claude zai",
-            b"--json-only=false --provider codex grok claude zai",
-            b"--json-only --provider codex.legacy grok.legacy claude.legacy zai.legacy",
-            b"--json-only --provider codex:false grok:false claude:false zai:false",
-            b"--json-only --provider codex/v2 grok/v2 claude/v2 zai/v2",
-            b"--json-only --provider legacy.codex legacy.grok legacy.claude legacy.zai",
+            b"--json-only codex grok claude antigravity",
+            b"--json-only --provider codex grok claude zai",
+            b"--provider codex grok claude antigravity zai",
+            b"--json-only --provider codex grok claude antigravity za1",
+            b"--json-only --provider codex grok claude antigravity zai-lookalike",
+            b"--json-only --provider codex grok claude antigravity zai=false",
+            b"--json-only-legacy --provider codex grok claude antigravity zai",
+            b"--json-only=false --provider codex grok claude antigravity zai",
+            b"--json-only --provider codex.legacy grok.legacy claude.legacy antigravity.legacy zai.legacy",
+            b"--json-only --provider codex:false grok:false claude:false antigravity:false zai:false",
+            b"--json-only --provider codex/v2 grok/v2 claude/v2 antigravity/v2 zai/v2",
+            b"--json-only --provider legacy.codex legacy.grok legacy.claude legacy.antigravity legacy.zai",
         )
         for index, help_payload in enumerate(invalid_help):
             with self.subTest(case=index):
@@ -863,6 +879,8 @@ class ProviderGatewayContractTests(_GatewayTestCase):
             ("codex", "oauth", "codex", ("--source", "oauth")),
             ("grok", "oauth", "grok", ("--source", "auto")),
             ("claude", "oauth", "claude", ("--source", "oauth")),
+            ("antigravity", "", "antigravity", ()),
+            ("antigravity", "oauth", "antigravity", ("--source", "oauth")),
         )
         for index, (runtime, source, physical, source_args) in enumerate(cases):
             with self.subTest(runtime=runtime, source=source):
@@ -1208,7 +1226,7 @@ class ProviderGatewayContractTests(_GatewayTestCase):
             "resetsAt": resets_at,
             "resetDescription": "provider-specific wording",
         }
-        for runtime in ("codex", "grok", "claude"):
+        for runtime in ("codex", "grok", "claude", "antigravity"):
             with self.subTest(runtime=runtime):
                 gateway, _executor = self.gateway(
                     payloads={
@@ -1421,7 +1439,7 @@ class ProviderGatewayContractTests(_GatewayTestCase):
 import json, os, sys
 args = sys.argv[1:]
 if args == ['usage', '--help']:
-    print('--provider codex|grok|claude|zai --json-only --no-color')
+    print('--provider codex|grok|claude|antigravity|zai --json-only --no-color')
     raise SystemExit(0)
 provider = args[args.index('--provider') + 1]
 secret = os.environ['OPENAI_API_KEY']
@@ -1582,7 +1600,7 @@ import os
 import sys
 
 if sys.argv[1:] == ["usage", "--help"]:
-    print("--provider codex grok claude zai --json-only --no-color")
+    print("--provider codex grok claude antigravity zai --json-only --no-color")
     raise SystemExit(0)
 print("provider rejected " + " ".join(os.environ["Z_AI_API_KEY"].split()), file=sys.stderr)
 raise SystemExit(9)
@@ -1626,7 +1644,7 @@ raise SystemExit(9)
         ):
             before = dict(os.environ)
             non_zai_records: list[dict[str, object]] = []
-            for runtime in ("codex", "grok"):
+            for runtime in ("codex", "grok", "antigravity"):
                 gateway, executor = self.gateway(expected_zai_token=configured_marker)
                 self.assertIsInstance(gateway.fetch(runtime), indicator.RuntimeResult)
                 non_zai_records.extend(executor.quota_calls)
@@ -1671,7 +1689,7 @@ raise SystemExit(9)
             f"""#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 if sys.argv[1:] == ["usage", "--help"]:
-    print("--provider codex grok claude zai --json-only --no-color")
+    print("--provider codex grok claude antigravity zai --json-only --no-color")
     raise SystemExit(0)
 matching_keys = sorted(
     key for key, value in os.environ.items() if {marker!r} in value

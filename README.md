@@ -2,7 +2,8 @@
 
 `codexbar-gnome` is a GTK 3/Ayatana AppIndicator front end for the
 [CodexBar CLI](https://github.com/steipete/CodexBar). It shows selected Codex,
-Grok, and Claude quota windows in the GNOME top bar and in a detailed tray menu.
+Grok, Claude, and Antigravity quota windows in the GNOME top bar and in a
+detailed tray menu.
 
 The application owns the D-Bus name
 `io.github.antonshalin76.CodexBarGnome`. Starting it twice activates the same
@@ -74,9 +75,9 @@ filesystem change.
 ## Provider behavior
 
 The tray menu has independent `Poll` and `Auto-refresh` switches for Codex,
-Grok, and Claude. Manual refresh polls every enabled runtime. Timer refresh
-polls only enabled auto-refresh runtimes. One request per runtime may be in
-flight; a concurrent request is coalesced into at most one rerun.
+Grok, Claude, and Antigravity. Manual refresh polls every enabled runtime. Timer
+refresh polls only enabled auto-refresh runtimes. One request per runtime may be
+in flight; a concurrent request is coalesced into at most one rerun.
 
 Current safe defaults:
 
@@ -92,6 +93,10 @@ Current safe defaults:
       "autoRefresh": true
     },
     "claude": {
+      "poll": false,
+      "autoRefresh": false
+    },
+    "antigravity": {
       "poll": false,
       "autoRefresh": false
     }
@@ -116,6 +121,7 @@ Provider reads use the CLI's JSON-only contract:
 codexbar usage --provider codex --json-only --no-color
 codexbar usage --provider grok --json-only --no-color
 codexbar usage --provider claude --json-only --no-color
+codexbar usage --provider antigravity --json-only --no-color
 codexbar usage --provider zai --json-only --no-color
 ```
 

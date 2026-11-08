@@ -316,7 +316,7 @@ args = sys.argv[1:]
 with open(os.environ['CODEXBAR_FAKE_LEDGER'], 'a', encoding='utf-8') as stream:
     stream.write(json.dumps(args) + '\\n')
 if args == ['usage', '--help']:
-    print('--provider codex|grok|claude|zai --json-only --no-color')
+    print('--provider codex|grok|claude|antigravity|zai --json-only --no-color')
     raise SystemExit(0)
 if args != ['usage', '--provider', 'codex', '--json-only', '--no-color']:
     raise SystemExit(64)

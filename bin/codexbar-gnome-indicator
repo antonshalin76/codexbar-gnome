@@ -285,8 +285,13 @@ from gi.repository import Gio, GLib, Gtk
 
 APPLICATION_ID = "io.github.antonshalin76.CodexBarGnome"
 INDICATOR_ID = "codexbar-gnome-indicator"
-RUNTIMES = ("codex", "grok", "claude")
-RUNTIME_LABELS = {"codex": "Codex", "grok": "Grok", "claude": "Claude"}
+RUNTIMES = ("codex", "grok", "claude", "antigravity")
+RUNTIME_LABELS = {
+    "codex": "Codex",
+    "grok": "Grok",
+    "claude": "Claude",
+    "antigravity": "Antigravity",
+}
 DEFAULT_REFRESH_SECONDS = 300
 MIN_REFRESH_SECONDS = 30
 MAX_REFRESH_SECONDS = 86400
@@ -301,6 +306,7 @@ DEFAULT_SETTINGS = {
         "codex": {"poll": True, "autoRefresh": True},
         "grok": {"poll": True, "autoRefresh": True},
         "claude": {"poll": False, "autoRefresh": False},
+        "antigravity": {"poll": False, "autoRefresh": False},
     }
 }
 FAIL_CLOSED_SETTINGS = {
@@ -2231,11 +2237,12 @@ class IndicatorView:
         windows: list[tuple[str, UsageWindow]] = []
         if runtime.runtime == "codex" and runtime.usage.secondary is not None:
             windows.append(("Codex Week", runtime.usage.secondary))
-        elif runtime.runtime == "grok":
+        elif runtime.runtime in {"grok", "antigravity"}:
+            label = RUNTIME_LABELS[runtime.runtime]
             if runtime.usage.primary is not None:
-                windows.append(("Grok Session", runtime.usage.primary))
+                windows.append((f"{label} Session", runtime.usage.primary))
             if runtime.usage.secondary is not None:
-                windows.append(("Grok Week", runtime.usage.secondary))
+                windows.append((f"{label} Week", runtime.usage.secondary))
         elif runtime.runtime == "claude":
             if runtime.usage.primary is not None:
                 name = (
@@ -2313,6 +2320,7 @@ class IndicatorView:
                 value = usage.primary if usage is not None else None
                 tokens.append(f"GkS {'100%' if guide else _percent(value)}")
             else:
+                prefix = "Cl" if runtime == "claude" else "Ag"
                 primary = usage.primary if usage is not None else None
                 secondary = usage.secondary if usage is not None else None
                 values = (
@@ -2320,7 +2328,7 @@ class IndicatorView:
                     if guide
                     else f"{_percent(primary)}/{_percent(secondary)}"
                 )
-                tokens.append(f"Cl {values}")
+                tokens.append(f"{prefix} {values}")
         return tokens, problem
 
     def render(self, snapshot: ViewSnapshot) -> None:

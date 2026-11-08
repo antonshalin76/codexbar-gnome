@@ -322,7 +322,7 @@ with ledger.open("a", encoding="utf-8") as stream:
     stream.flush()
     os.fsync(stream.fileno())
 if argv == ["usage", "--help"]:
-    print("usage --json-only --provider codex grok claude zai")
+    print("usage --json-only --provider codex grok claude antigravity zai")
 elif argv == [
     "usage", "--provider", "codex", "--json-only", "--no-color"
 ]:

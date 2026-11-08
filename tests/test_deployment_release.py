@@ -32,6 +32,7 @@ DEFAULT_SETTINGS = {
         "codex": {"poll": True, "autoRefresh": True},
         "grok": {"poll": True, "autoRefresh": True},
         "claude": {"poll": False, "autoRefresh": False},
+        "antigravity": {"poll": False, "autoRefresh": False},
     },
 }
 
@@ -197,7 +198,12 @@ def _tree_snapshot(paths: list[Path]) -> dict[str, tuple[object, ...]]:
 
 
 class IsolatedHome:
-    """Writable /mnt inside a read-only, network- and PID-isolated host view."""
+    """Writable /mnt inside a read-only, network- and PID-isolated host view.
+
+    The guest keeps the caller's unprivileged uid: the lifecycle scripts are
+    per-user installers, and a fake root makes the guest ``dbus-daemon`` try to
+    raise ``RLIMIT_NOFILE`` and emit host-dependent stderr.
+    """
 
     def __init__(self) -> None:
         self._temporary = tempfile.TemporaryDirectory(prefix="codexbar-deploy-test-")
@@ -271,10 +277,6 @@ class IsolatedHome:
             "/usr/bin/bwrap",
             "--die-with-parent",
             "--unshare-user",
-            "--uid",
-            "0",
-            "--gid",
-            "0",
             "--unshare-net",
         ]
         if pid_namespace:
@@ -332,10 +334,6 @@ class IsolatedHome:
             "/usr/bin/bwrap",
             "--die-with-parent",
             "--unshare-user",
-            "--uid",
-            "0",
-            "--gid",
-            "0",
             "--unshare-net",
         ]
         if pid_namespace:
@@ -721,7 +719,7 @@ class DeploymentReleaseTests(unittest.TestCase):
         self.assertEqual(_mode(binary), 0o755)
         self.assertEqual(_mode(desktop), 0o644)
         self.assertEqual(_mode(autostart), 0o644)
-        for runtime in ("Codex", "Grok", "Claude"):
+        for runtime in ("Codex", "Grok", "Claude", "Antigravity"):
             self.assertIn(runtime, desktop.read_text(encoding="utf-8"))
         self._assert_manifest()
 
@@ -1109,7 +1107,7 @@ class DeploymentReleaseTests(unittest.TestCase):
             "#!/usr/bin/python3\n"
             "import json, sys\n"
             "if sys.argv[1:] == ['usage', '--help']:\n"
-            "    print('--provider codex grok claude zai --json-only --no-color')\n"
+            "    print('--provider codex grok claude antigravity zai --json-only --no-color')\n"
             "elif sys.argv[1:] == ['usage', '--provider', 'codex', '--json-only', '--no-color']:\n"
             "    print(json.dumps([{'provider':'codex','usage':{'secondary':{'usedPercent':7}}}]))\n"
             "else:\n"
@@ -1297,7 +1295,7 @@ finally:
             "with open(os.environ['FAKE_CODEXBAR_LEDGER'], 'a', encoding='utf-8') as f:\n"
             "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             "if sys.argv[1:] == ['usage', '--help']:\n"
-            "    print('--provider codex|grok|claude|zai --json-only --no-color')\n"
+            "    print('--provider codex|grok|claude|antigravity|zai --json-only --no-color')\n"
             "elif sys.argv[1:] == ['usage', '--provider', 'codex', '--json-only', '--no-color']:\n"
             '    print(\'[{"provider":"codex","usage":{"secondary":{"usedPercent":7}}}]\')\n'
             "else:\n"

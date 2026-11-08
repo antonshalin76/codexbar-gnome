@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 from tests.support import MODULE_PATH, load_indicator
 
 indicator = load_indicator("codexbar_refresh_view_tests")
-RUNTIMES = ("codex", "grok", "claude")
+RUNTIMES = ("codex", "grok", "claude", "antigravity")
 
 
 def _settings(**modes: str) -> dict[str, object]:
@@ -1012,7 +1012,7 @@ if args == ['usage', '--help']:
         if time.monotonic() >= deadline:
             raise SystemExit(70)
         time.sleep(0.01)
-    print('--provider codex|grok|claude|zai --json-only --no-color')
+    print('--provider codex|grok|claude|antigravity|zai --json-only --no-color')
     raise SystemExit(0)
 provider = args[args.index('--provider') + 1]
 print(json.dumps([{
@@ -1220,7 +1220,7 @@ if args == ['usage', '--help']:
         if time.monotonic() >= deadline:
             raise SystemExit(70)
         time.sleep(0.01)
-    print('--provider codex|grok|claude|zai --json-only --no-color')
+    print('--provider codex|grok|claude|antigravity|zai --json-only --no-color')
     raise SystemExit(0)
 provider = args[args.index('--provider') + 1]
 print(json.dumps([{
@@ -1440,7 +1440,7 @@ print(json.dumps([{
                             )
                         return indicator.ProcessResult(
                             0,
-                            b"--provider codex|grok|claude|zai --json-only --no-color",
+                            b"--provider codex|grok|claude|antigravity|zai --json-only --no-color",
                             b"",
                         )
                     return indicator.ProcessResult(
@@ -1806,7 +1806,9 @@ print(json.dumps([{
             coordinator.close()
 
     def test_bdd_r12_all_27_selection_modes(self) -> None:
-        for mode_tuple in itertools.product(("off", "manual", "auto"), repeat=3):
+        for mode_tuple in itertools.product(
+            ("off", "manual", "auto"), repeat=len(RUNTIMES)
+        ):
             modes = dict(zip(RUNTIMES, mode_tuple))
             with self.subTest(modes=modes):
                 submitter = ManualSubmitter()
@@ -2003,13 +2005,18 @@ class IndicatorViewRedTests(unittest.TestCase):
                 _runtime_snapshot("codex", "pending"),
                 _runtime_snapshot("grok", "good", usage=_usage(12, secondary=34)),
                 _runtime_snapshot("claude", "error", error="offline"),
+                _runtime_snapshot(
+                    "antigravity", "good", usage=_usage(56, secondary=78)
+                ),
             )
         )
-        mixed_rows = _visible_menu_labels(self.view)[:4]
+        mixed_rows = _visible_menu_labels(self.view)[:6]
         self.assertEqual(mixed_rows[0], "Codex: pending")
         self.assertIn("Grok Session", mixed_rows[1])
         self.assertIn("Grok Week", mixed_rows[2])
         self.assertEqual(mixed_rows[3], "Claude: ERROR: offline")
+        self.assertIn("Antigravity Session", mixed_rows[4])
+        self.assertIn("Antigravity Week", mixed_rows[5])
 
         self.view.render(
             _snapshot(_runtime_snapshot("codex", "good", usage=indicator.Usage()))
@@ -2026,6 +2033,7 @@ class IndicatorViewRedTests(unittest.TestCase):
         self.assertNotIn("!", self.panel.labels[-1][0])
         self.assertNotIn("GkS", self.panel.labels[-1][0])
         self.assertNotIn("Cl", self.panel.labels[-1][0])
+        self.assertNotIn("Ag", self.panel.labels[-1][0])
 
         self.view.render(
             _snapshot(
@@ -2034,10 +2042,18 @@ class IndicatorViewRedTests(unittest.TestCase):
                 _runtime_snapshot(
                     "claude", "good", usage=_usage(18, secondary=96), source="zai"
                 ),
+                _runtime_snapshot(
+                    "antigravity", "good", usage=_usage(45, secondary=80)
+                ),
             )
         )
-        self.assertEqual(self.panel.labels[-1][0], "CxW 37%  GkS 12%  Cl 18%/96% !")
-        self.assertEqual(self.panel.labels[-1][1], "CxW 100%  GkS 100%  Cl 100%/100% !")
+        self.assertEqual(
+            self.panel.labels[-1][0], "CxW 37%  GkS 12%  Cl 18%/96%  Ag 45%/80% !"
+        )
+        self.assertEqual(
+            self.panel.labels[-1][1],
+            "CxW 100%  GkS 100%  Cl 100%/100%  Ag 100%/100% !",
+        )
 
         self.view.render(_snapshot(_runtime_snapshot("grok", "error", error="offline")))
         self.assertEqual(self.panel.labels[-1][0], "GkS -- !")
@@ -2244,7 +2260,7 @@ class IndicatorViewRedTests(unittest.TestCase):
                 raise RuntimeError("malformed timezone")
 
         malformed_datetimes = (
-            datetime(2030, 1, 1, tzinfo=None),  # noqa: DTZ001 - malformed fixture
+            datetime(2030, 1, 1, tzinfo=None),  # malformed naive datetime fixture
             datetime(2030, 1, 1, tzinfo=MissingOffset()),
             datetime(2030, 1, 1, tzinfo=RaisingOffset()),
         )
@@ -2312,6 +2328,15 @@ class IndicatorViewRedTests(unittest.TestCase):
                     extras=(indicator.UsageExtra(window=window(32)),),
                 ),
             ),
+            _runtime_snapshot(
+                "antigravity",
+                "good",
+                usage=indicator.Usage(
+                    primary=window(40),
+                    secondary=window(41),
+                    extras=(indicator.UsageExtra(window=window(42)),),
+                ),
+            ),
         )
         rows = [
             row
@@ -2319,7 +2344,7 @@ class IndicatorViewRedTests(unittest.TestCase):
             for row in indicator.IndicatorView._normal_rows(runtime, now=now)
         ]
 
-        self.assertEqual(len(rows), 8)
+        self.assertEqual(len(rows), 11)
         self.assertTrue(
             all(row.endswith(" · resets Sep 11 at 4:58\u202fPM") for row in rows)
         )
@@ -2367,7 +2392,7 @@ class IndicatorViewRedTests(unittest.TestCase):
                 if request.argv[1:] == ("usage", "--help"):
                     return indicator.ProcessResult(
                         0,
-                        b"--provider codex|grok|claude|zai --json-only --no-color\n",
+                        b"--provider codex|grok|claude|antigravity|zai --json-only --no-color\n",
                         b"",
                     )
                 provider = request.argv[request.argv.index("--provider") + 1]
@@ -2461,6 +2486,8 @@ class IndicatorViewRedTests(unittest.TestCase):
                     "Auto-refresh Grok",
                     "Poll Claude",
                     "Auto-refresh Claude",
+                    "Poll Antigravity",
+                    "Auto-refresh Antigravity",
                 },
             )
             controls["Poll Claude"].set_active(True)
@@ -2703,7 +2730,7 @@ import subprocess
 import sys
 
 if sys.argv[1:] == ["usage", "--help"]:
-    print("--json-only --provider codex grok claude zai")
+    print("--json-only --provider codex grok claude antigravity zai")
     raise SystemExit(0)
 
 provider = sys.argv[sys.argv.index("--provider") + 1]
