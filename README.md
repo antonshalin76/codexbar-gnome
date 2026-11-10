@@ -34,17 +34,17 @@ sh install.sh
 gtk-launch codexbar-gnome-indicator
 ```
 
-Release `0.1.2` contains these downloadable artifacts:
+Release `0.1.3` contains these downloadable artifacts:
 
-- `codexbar-gnome-0.1.2.tar.gz`
-- `codexbar-gnome-0.1.2.tar.gz.sha256`
+- `codexbar-gnome-0.1.3.tar.gz`
+- `codexbar-gnome-0.1.3.tar.gz.sha256`
 
 Verify and install a downloaded release:
 
 ```bash
-sha256sum -c codexbar-gnome-0.1.2.tar.gz.sha256
-tar -xzf codexbar-gnome-0.1.2.tar.gz
-cd codexbar-gnome-0.1.2
+sha256sum -c codexbar-gnome-0.1.3.tar.gz.sha256
+tar -xzf codexbar-gnome-0.1.3.tar.gz
+cd codexbar-gnome-0.1.3
 sh install.sh
 ```
 
@@ -104,6 +104,16 @@ Current safe defaults:
 }
 ```
 
+Enable `Poll Antigravity` and `Auto-refresh Antigravity` in the tray menu to show
+its limits. The `Ag` panel values show percentage **used**, in this order: Gemini
+Flash/Pro, Claude + GPT, and Gemini 4 Argon when its separate weekly quota is
+reported. The Antigravity CLI shows percentage **remaining**, so its values are
+complementary. Measured quota windows remain available in the menu and details.
+Windows marked as unmeasured by CodexBar are omitted instead of showing a
+misleading zero. Antigravity must have an authenticated source available to the
+CodexBar CLI. Live CLI quota reporting was verified with CodexBar 0.84.0 and
+`agy` 1.5.4.
+
 Settings are replaced atomically by `GLib.file_set_contents_full` with
 `CONSISTENT` and `DURABLE` flags and mode `0600`. A malformed or unreadable
 settings file is preserved byte for byte and polling fails closed until it is
@@ -153,8 +163,11 @@ produce a bounded diagnostic.
 The packaged X11 E2E runner does not claim Wayland coverage. It validates the
 real release archive under Xvfb and an isolated session bus. A real GNOME
 Wayland session is required for the separate external release receipt. If the
-StatusNotifierWatcher is missing, startup reports the problem visibly and
-remains controllable through the application quit action.
+StatusNotifierWatcher is missing, the application reports the problem visibly and
+remains controllable through the application quit action. It tracks the watcher
+on D-Bus and clears that warning when the panel becomes available, including
+after a GNOME Shell restart. The desktop entry supports both GNOME launching and
+the systemd XDG autostart generator, including home directories with spaces.
 
 ## Development and release checks
 
@@ -189,11 +202,11 @@ Inspect the publication plan without creating a tag or GitHub resource:
 
 ```bash
 scripts/publish-release.sh --dry-run \
-  --archive dist/codexbar-gnome-0.1.2.tar.gz \
-  --checksum dist/codexbar-gnome-0.1.2.tar.gz.sha256
+  --archive dist/codexbar-gnome-0.1.3.tar.gz \
+  --checksum dist/codexbar-gnome-0.1.3.tar.gz.sha256
 ```
 
-Publication creates an annotated `v0.1.2` tag and a draft GitHub release,
+Publication creates an annotated `v0.1.3` tag and a draft GitHub release,
 uploads and verifies both artifacts, then publishes. A failure before
 publication rolls back only resources created by that invocation. A verified
 existing release is treated as an idempotent success; foreign or mismatched

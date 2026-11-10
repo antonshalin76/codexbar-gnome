@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3 - 2026-11-10
+
+- Added Antigravity polling controls and quota display for Gemini Flash/Pro, Claude/GPT, and the separate Gemini 4 Argon weekly limit.
+- Included measured Argon quota in the top-bar summary and omitted unmeasured windows instead of showing false zero values.
+- Tracked StatusNotifierWatcher availability over D-Bus so panel recovery clears the startup warning without clearing other errors.
+- Fixed GNOME and systemd autostart commands, including home directories containing spaces and special characters.
+- Added regression coverage for watcher recovery, quota-group projection, and native systemd autostart generation.
+
 ## 0.1.2 - 2026-09-05
 
 - Normalized quota-reset timestamps for Codex, Grok, Claude, and Claude/Z.AI in one local-time Codex-style format.

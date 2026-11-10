@@ -973,6 +973,41 @@ class ProviderGatewayContractTests(_GatewayTestCase):
         self.assertNotIn("accountEmail", repr(result))
         self.assertNotIn("must-not-cross", repr(result))
 
+    def test_bdd_p04_unmeasured_extra_windows_are_not_reported_as_zero(self) -> None:
+        for flag in (False, True, None, 0, 1, "false", [], {}):
+            with self.subTest(usageKnown=flag):
+                payload = [
+                    {
+                        "provider": "antigravity",
+                        "usage": {
+                            "extraRateWindows": [
+                                {
+                                    "title": "Gemini weekly",
+                                    "window": {"usedPercent": 12},
+                                },
+                                {
+                                    "title": "Claude/GPT 5-hour",
+                                    "usageKnown": flag,
+                                    "window": {"usedPercent": 0},
+                                },
+                            ],
+                        },
+                    }
+                ]
+                gateway, _executor = self.gateway(payloads={"antigravity": payload})
+                result = gateway.fetch("antigravity")
+                if type(flag) is not bool:
+                    self.assert_runtime_failure(result, "antigravity")
+                    self.assertEqual(result.kind, "schema")
+                else:
+                    self.assertIsInstance(result, indicator.RuntimeResult)
+                    self.assertEqual(
+                        [extra.provider_title for extra in result.usage.extras],
+                        ["Gemini weekly", "Claude/GPT 5-hour"]
+                        if flag
+                        else ["Gemini weekly"],
+                    )
+
     def test_bdd_p04_null_window_slots_are_absent(self) -> None:
         payload = [
             {

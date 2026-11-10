@@ -2015,8 +2015,11 @@ class IndicatorViewRedTests(unittest.TestCase):
         self.assertIn("Grok Session", mixed_rows[1])
         self.assertIn("Grok Week", mixed_rows[2])
         self.assertEqual(mixed_rows[3], "Claude: ERROR: offline")
-        self.assertIn("Antigravity Session", mixed_rows[4])
-        self.assertIn("Antigravity Week", mixed_rows[5])
+        self.assertIn("Antigravity Gemini", mixed_rows[4])
+        self.assertIn("Antigravity Claude + GPT", mixed_rows[5])
+        details = self.view.show_details()
+        self.assertIn("Antigravity Gemini: 56%", _dialog_text(details))
+        self.assertIn("Antigravity Claude + GPT: 78%", _dialog_text(details))
 
         self.view.render(
             _snapshot(_runtime_snapshot("codex", "good", usage=indicator.Usage()))
@@ -2054,6 +2057,46 @@ class IndicatorViewRedTests(unittest.TestCase):
             self.panel.labels[-1][1],
             "CxW 100%  GkS 100%  Cl 100%/100%  Ag 100%/100% !",
         )
+
+        for extra_id, known, expected in (
+            (
+                "antigravity-quota-summary-gemini-argon-wtu-weekly",
+                True,
+                "Ag 45%/80%/94%",
+            ),
+            ("another-model-weekly", True, "Ag 45%/80%"),
+            ("antigravity-quota-summary-gemini-argon-wtu-weekly", False, "Ag 45%/80%"),
+        ):
+            with self.subTest(extra_id=extra_id, usageKnown=known):
+                usage = indicator.ProviderGateway._regular_usage(
+                    {
+                        "primary": {"usedPercent": 45},
+                        "secondary": {"usedPercent": 80},
+                        "extraRateWindows": [
+                            {
+                                "id": extra_id,
+                                "title": "Gemini 4 Argon weekly",
+                                "usageKnown": known,
+                                "window": {"usedPercent": 94, "windowMinutes": 10080},
+                            }
+                        ],
+                    }
+                )
+                self.view.render(
+                    _snapshot(_runtime_snapshot("antigravity", "good", usage=usage))
+                )
+                self.assertEqual(self.panel.labels[-1][0], expected)
+                self.assertEqual(
+                    self.panel.labels[-1][1],
+                    "Ag " + "/".join(["100%"] * expected.count("%")),
+                )
+                if known:
+                    self.assertTrue(
+                        any(
+                            "94%" in row and "Gemini 4 Argon weekly" in row
+                            for row in _visible_menu_labels(self.view)
+                        )
+                    )
 
         self.view.render(_snapshot(_runtime_snapshot("grok", "error", error="offline")))
         self.assertEqual(self.panel.labels[-1][0], "GkS -- !")
@@ -3456,6 +3499,11 @@ raise SystemExit(application.run([sys.argv[0]]))
         timer = FakeTimerPort()
         warnings: list[str] = []
         warning_seen = threading.Event()
+        unwatched: list[int] = []
+
+        def unwatch(watcher_id: int) -> None:
+            unwatched.append(watcher_id)
+            indicator.Gio.bus_unwatch_name(watcher_id)
 
         def record_warning(message: str) -> None:
             warnings.append(message)
@@ -3469,7 +3517,8 @@ raise SystemExit(application.run([sys.argv[0]]))
             timer_remove=timer.remove,
             application_hold=lambda: None,
             application_release=lambda: None,
-            watcher_probe=lambda: False,
+            watcher_watch=indicator.Gio.bus_watch_name,
+            watcher_unwatch=unwatch,
             warning_sink=record_warning,
         )
         try:
@@ -3491,6 +3540,44 @@ raise SystemExit(application.run([sys.argv[0]]))
             )
             self.assertEqual(gateway.calls, [])
 
+            changed = threading.Event()
+            original_render = view.render
+
+            def render_and_signal(snapshot) -> None:
+                original_render(snapshot)
+                changed.set()
+
+            coordinator._on_snapshot = render_and_signal
+            owner_id = 0
+            try:
+                for _ in range(2):
+                    changed.clear()
+                    owner_id = indicator.Gio.bus_own_name(
+                        indicator.Gio.BusType.SESSION,
+                        "org.kde.StatusNotifierWatcher",
+                        indicator.Gio.BusNameOwnerFlags.NONE,
+                        None,
+                        None,
+                        None,
+                    )
+                    _pump_gtk_until(changed)
+                    labels = _visible_menu_labels(view)
+                    self.assertFalse(
+                        any("StatusNotifierWatcher" in label for label in labels)
+                    )
+                    self.assertTrue(any("Settings error:" in label for label in labels))
+                    changed.clear()
+                    indicator.Gio.bus_unown_name(owner_id)
+                    owner_id = 0
+                    _pump_gtk_until(changed)
+                    labels = _visible_menu_labels(view)
+                    self.assertTrue(
+                        any("StatusNotifierWatcher" in label for label in labels)
+                    )
+            finally:
+                if owner_id:
+                    indicator.Gio.bus_unown_name(owner_id)
+
             self.assertTrue(coordinator.update_settings(_settings()))
             recovered_labels = _visible_menu_labels(view)
             self.assertTrue(
@@ -3503,48 +3590,13 @@ raise SystemExit(application.run([sys.argv[0]]))
             )
         finally:
             application.shutdown()
-
-        probe_entered = threading.Event()
-        probe_release = threading.Event()
-        start_returned = threading.Event()
-        start_failures: list[BaseException] = []
-
-        def blocking_probe() -> bool:
-            probe_entered.set()
-            if not probe_release.wait(3):
-                raise AssertionError("test did not release watcher probe")
-            return True
-
-        nonblocking_application = indicator.CodexBarApplication(
-            coordinator=FakeLifecycleCoordinator(),
-            view=FakeLifecycleView(),
-            refresh_seconds=30,
-            timer_add=lambda _seconds, _callback: 92,
-            timer_remove=lambda _timer_id: True,
-            application_hold=lambda: None,
-            application_release=lambda: None,
-            watcher_probe=blocking_probe,
-        )
-
-        def start_application() -> None:
-            try:
-                nonblocking_application.start()
-            except BaseException as exc:  # noqa: BLE001 - retained for test thread
-                start_failures.append(exc)
-            finally:
-                start_returned.set()
-
-        starter = threading.Thread(target=start_application, daemon=True)
-        starter.start()
-        self.assertTrue(probe_entered.wait(1))
-        returned_before_probe = start_returned.wait(1)
-        probe_release.set()
-        starter.join(timeout=3)
-        nonblocking_application.shutdown()
-        self.assertTrue(
-            returned_before_probe, "watcher probe blocked application start"
-        )
-        self.assertEqual(start_failures, [])
+        self.assertEqual(len(unwatched), 1)
+        warning_count = len(warnings)
+        application.shutdown()
+        application._watcher_changed(False)
+        application._watcher_changed(True)
+        self.assertEqual(len(unwatched), 1)
+        self.assertEqual(len(warnings), warning_count)
 
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)

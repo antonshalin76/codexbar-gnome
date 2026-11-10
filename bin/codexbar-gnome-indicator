@@ -474,6 +474,7 @@ class UsageExtra:
     window: UsageWindow
     slot: str = "extra"
     provider_title: str | None = None
+    provider_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1394,11 +1395,21 @@ class ProviderGateway:
                 if isinstance(raw_title, str) and raw_title
                 else None
             )
+            usage_known = raw_extra.get("usageKnown", True)
+            if not isinstance(usage_known, bool):
+                raise ProcessFailure(
+                    "schema", "extra rate window usageKnown must be a boolean"
+                )
             parsed_extra = UsageExtra(
                 _parse_window(raw_extra["window"], sensitive_values),
                 provider_title=provider_title,
+                provider_id=(
+                    sanitize_diagnostic(raw_extra["id"], sensitive_values)[:128]
+                    if raw_extra.get("id")
+                    else None
+                ),
             )
-            if len(extras) < MAX_USAGE_EXTRAS:
+            if usage_known and len(extras) < MAX_USAGE_EXTRAS:
                 extras.append(parsed_extra)
         return Usage(primary, secondary, tuple(extras))
 
@@ -2039,13 +2050,15 @@ class RefreshCoordinator:
                 return None
             return copy.deepcopy(candidate)
 
-    def set_global_error(self, message: str | None) -> None:
+    def set_global_error(self, message: str | None, *, key: str | None = None) -> None:
         with self._lock:
             if self._closed:
                 return
             if message:
                 sanitized = sanitize_diagnostic(message)
-                self._global_errors[self._error_key(sanitized)] = sanitized
+                self._global_errors[key or self._error_key(sanitized)] = sanitized
+            elif key is not None:
+                self._global_errors.pop(key, None)
             else:
                 self._global_errors.clear()
             published = self._snapshot_locked()
@@ -2239,10 +2252,15 @@ class IndicatorView:
             windows.append(("Codex Week", runtime.usage.secondary))
         elif runtime.runtime in {"grok", "antigravity"}:
             label = RUNTIME_LABELS[runtime.runtime]
+            primary, secondary = (
+                ("Gemini", "Claude + GPT")
+                if runtime.runtime == "antigravity"
+                else ("Session", "Week")
+            )
             if runtime.usage.primary is not None:
-                windows.append((f"{label} Session", runtime.usage.primary))
+                windows.append((f"{label} {primary}", runtime.usage.primary))
             if runtime.usage.secondary is not None:
-                windows.append((f"{label} Week", runtime.usage.secondary))
+                windows.append((f"{label} {secondary}", runtime.usage.secondary))
         elif runtime.runtime == "claude":
             if runtime.usage.primary is not None:
                 name = (
@@ -2279,7 +2297,13 @@ class IndicatorView:
             if runtime.runtime == "claude" and runtime.source == "zai"
             else RUNTIME_LABELS[runtime.runtime]
         )
-        names = ("5h", "7d") if runtime.source == "zai" else ("session", "weekly")
+        names = (
+            ("Gemini", "Claude + GPT")
+            if runtime.runtime == "antigravity"
+            else ("5h", "7d")
+            if runtime.source == "zai"
+            else ("session", "weekly")
+        )
         rows = [
             sanitize_diagnostic(f"{owner} {name}: {window.percent}%")
             for name, window in zip(
@@ -2328,6 +2352,18 @@ class IndicatorView:
                     if guide
                     else f"{_percent(primary)}/{_percent(secondary)}"
                 )
+                if runtime == "antigravity" and usage is not None:
+                    argon = next(
+                        (
+                            extra.window
+                            for extra in usage.extras
+                            if extra.provider_id
+                            == "antigravity-quota-summary-gemini-argon-wtu-weekly"
+                        ),
+                        None,
+                    )
+                    if argon is not None:
+                        values += f"/{'100%' if guide else _percent(argon)}"
                 tokens.append(f"{prefix} {values}")
         return tokens, problem
 
@@ -2450,25 +2486,6 @@ class IndicatorView:
             dialog.destroy()
 
 
-def _status_notifier_watcher_available() -> bool:
-    try:
-        connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-        result = connection.call_sync(
-            "org.freedesktop.DBus",
-            "/org/freedesktop/DBus",
-            "org.freedesktop.DBus",
-            "NameHasOwner",
-            GLib.Variant("(s)", ("org.kde.StatusNotifierWatcher",)),
-            GLib.VariantType("(b)"),
-            Gio.DBusCallFlags.NONE,
-            2000,
-            None,
-        )
-        return bool(result.unpack()[0])
-    except GLib.Error:
-        return False
-
-
 class CodexBarApplication:
     def __init__(
         self,
@@ -2481,7 +2498,8 @@ class CodexBarApplication:
         timer_remove: Callable[[int], bool] = GLib.source_remove,
         application_hold: Callable[[], None] | None = None,
         application_release: Callable[[], None] | None = None,
-        watcher_probe: Callable[[], bool] | None = None,
+        watcher_watch: Callable[..., int] | None = None,
+        watcher_unwatch: Callable[[int], None] = Gio.bus_unwatch_name,
         warning_sink: Callable[[str], object] | None = None,
     ) -> None:
         self._application = Gtk.Application(
@@ -2507,7 +2525,9 @@ class CodexBarApplication:
         self._timer_remove = timer_remove
         self._hold = application_hold or self._application.hold
         self._release = application_release or self._application.release
-        self._watcher_probe = watcher_probe
+        self._watcher_watch = watcher_watch
+        self._watcher_unwatch = watcher_unwatch
+        self._watcher_id: int | None = None
         self._warning_sink = warning_sink or (
             lambda message: print(message, file=sys.stderr)
         )
@@ -2655,32 +2675,17 @@ class CodexBarApplication:
         _attempt(self._coordinator.request_auto)
         return True
 
-    def _probe_watcher_async(self, probe: Callable[[], bool]) -> None:
-        def run_probe() -> None:
-            try:
-                available = bool(probe())
-            except Exception:  # noqa: BLE001 - optional desktop capability probe
-                available = False
-            if available:
-                return
-
-            def publish_warning() -> None:
-                if self._closed:
-                    return
-                warning = sanitize_diagnostic(
-                    "StatusNotifierWatcher is unavailable; the panel icon may be hidden"
-                )
-                _attempt(lambda warning=warning: self._warning_sink(warning))
-                if hasattr(self._coordinator, "set_global_error"):
-                    _attempt(lambda: self._coordinator.set_global_error(warning))
-
-            self._queue_idle(publish_warning)
-
-        threading.Thread(
-            target=run_probe,
-            name="codexbar-watcher-probe",
-            daemon=True,
-        ).start()
+    def _watcher_changed(self, available: bool) -> None:
+        if self._closed:
+            return
+        warning = None
+        if not available:
+            warning = (
+                "StatusNotifierWatcher is unavailable; the panel icon may be hidden"
+            )
+            _attempt(lambda: self._warning_sink(warning))
+        if hasattr(self._coordinator, "set_global_error"):
+            _attempt(lambda: self._coordinator.set_global_error(warning, key="watcher"))
 
     def start(self) -> None:
         if self._started or self._closed:
@@ -2689,11 +2694,17 @@ class CodexBarApplication:
             self._ensure_components()
             self._hold()
             self._started = True
-            probe = self._watcher_probe
-            if probe is None and self._production_default:
-                probe = _status_notifier_watcher_available
-            if probe is not None:
-                self._probe_watcher_async(probe)
+            watch = self._watcher_watch
+            if watch is None and self._production_default:
+                watch = Gio.bus_watch_name
+            if watch is not None:
+                self._watcher_id = watch(
+                    Gio.BusType.SESSION,
+                    "org.kde.StatusNotifierWatcher",
+                    Gio.BusNameWatcherFlags.NONE,
+                    lambda *_args: self._watcher_changed(True),
+                    lambda *_args: self._watcher_changed(False),
+                )
             seconds = self._refresh_seconds
             if seconds is None:
                 seconds = parse_refresh_seconds(
@@ -2711,6 +2722,12 @@ class CodexBarApplication:
             return
         self._closed = True
         cleanup: list[tuple[str, Callable[[], object]]] = []
+        if self._watcher_id is not None:
+            watcher_id = self._watcher_id
+            self._watcher_id = None
+            cleanup.append(
+                ("watcher removal", lambda: self._watcher_unwatch(watcher_id))
+            )
         if self._timer_id is not None:
             timer_id = self._timer_id
             self._timer_id = None
