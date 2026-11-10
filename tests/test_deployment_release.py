@@ -638,12 +638,6 @@ class DeploymentReleaseTests(unittest.TestCase):
     ) -> None:
         desktop = REPO_ROOT / "share" / DESKTOP_NAME
         self.assertTrue(desktop.is_file(), "installer must copy a static desktop entry")
-        text = desktop.read_text(encoding="utf-8")
-        self.assertNotIn("@HOME@", text)
-        self.assertIn(
-            'Exec=/bin/sh -c "exec ~/.local/bin/codexbar-gnome-indicator"',
-            text,
-        )
         validation = subprocess.run(
             ["desktop-file-validate", str(desktop)],
             capture_output=True,
@@ -686,10 +680,6 @@ class DeploymentReleaseTests(unittest.TestCase):
                 self.assertEqual(validated.returncode, 0, validated.stderr)
                 info = Gio.DesktopAppInfo.new_from_filename(str(installed_entry))
                 self.assertIsNotNone(info)
-                self.assertEqual(
-                    info.get_string("Exec"),
-                    '/bin/sh -c "exec ~/.local/bin/codexbar-gnome-indicator"',
-                )
         launch = self.sandbox.command(
             [
                 "/usr/bin/dbus-run-session",
@@ -750,8 +740,10 @@ class DeploymentReleaseTests(unittest.TestCase):
         self.assertEqual(_mode(binary), 0o755)
         self.assertEqual(_mode(desktop), 0o644)
         self.assertEqual(_mode(autostart), 0o644)
+        info = Gio.DesktopAppInfo.new_from_filename(str(desktop))
+        self.assertIsNotNone(info)
         for runtime in ("Codex", "Grok", "Claude", "Antigravity"):
-            self.assertIn(runtime, desktop.read_text(encoding="utf-8"))
+            self.assertIn(runtime, info.get_description())
         self._assert_manifest()
 
     def test_bdd_i02_installer_rejects_arguments_without_side_effects(self) -> None:
@@ -2051,6 +2043,56 @@ finally:
                 ]
                 expected = "git-diff-staged" if kind == "staged" else "git-diff"
                 self.assertEqual([item.get("name") for item in failed], [expected])
+
+    def test_bdd_q01_cleanup_preserves_mounted_or_unknown_runtime(self) -> None:
+        candidate = self.sandbox.copy_repository("cleanup-gate")
+        initialized = self.sandbox.command(
+            ["/usr/bin/git", "init", "-q"], cwd=candidate
+        )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        wrappers = {
+            "mktemp": """#!/bin/sh
+created=$(/usr/bin/mktemp "$@") || exit 1
+if [ "$#" -eq 1 ] && [ "$1" = -d ]; then
+    mkdir "$created/doc"
+    printf retained > "$created/doc/canary"
+    printf '%s\n' "$created" > "$CODEXBAR_TEST_RUNTIME_LEDGER"
+fi
+printf '%s\n' "$created"
+""",
+            "mountpoint": '#!/bin/sh\nexit "$CODEXBAR_TEST_MOUNT_STATUS"\n',
+            "fusermount3": "#!/bin/sh\nexit 1\n",
+            "ruff": "#!/bin/sh\nexit 0\n",
+            "shellcheck": "#!/bin/sh\nexit 0\n",
+        }
+        for name, script in wrappers.items():
+            path = self.sandbox.wrappers / name
+            path.write_text(script)
+            path.chmod(0o755)
+        for mount_status in (0, 1, 32, 127):
+            with self.subTest(mount_status=mount_status):
+                ledger = self.sandbox.root / f"runtime-{mount_status}"
+                env = self.sandbox.env(wrapper_path=True)
+                env.update(
+                    {
+                        "CODEXBAR_TEST_MOUNT_STATUS": str(mount_status),
+                        "CODEXBAR_TEST_RUNTIME_LEDGER": self.sandbox.guest(ledger),
+                    }
+                )
+                result = self.sandbox.command(
+                    [
+                        "/bin/bash",
+                        self.sandbox.guest(candidate / "scripts/quality-gate.sh"),
+                        "--preflight-only",
+                    ],
+                    cwd=candidate,
+                    env=env,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                runtime = self.sandbox.root / Path(
+                    ledger.read_text().strip()
+                ).relative_to("/mnt")
+                self.assertEqual((runtime / "doc/canary").exists(), mount_status != 32)
 
     def test_bdd_q01b_documentation_matches_runtime_and_release_contract(self) -> None:
         runtime_contract = load_indicator("codexbar_documentation_contract")

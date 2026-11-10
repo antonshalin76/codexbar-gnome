@@ -7,6 +7,7 @@
 - Tracked StatusNotifierWatcher availability over D-Bus so panel recovery clears the startup warning without clearing other errors.
 - Fixed GNOME and systemd autostart commands, including home directories containing spaces and special characters.
 - Added regression coverage for watcher recovery, quota-group projection, and native systemd autostart generation.
+- Preserved mounted or unknown temporary runtime trees during quality-gate cleanup.
 
 ## 0.1.2 - 2026-09-05
 

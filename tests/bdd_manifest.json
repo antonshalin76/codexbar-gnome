@@ -84,7 +84,7 @@
     "BDD-E05": {"status": "deterministic", "tests": ["tests.test_refresh_view.ApplicationLifecycleRedTests.test_bdd_e05_missing_status_notifier_watcher_is_visible_and_quittable"]},
     "BDD-E06": {"status": "external-gate", "tests": [], "receipt": ".release/evidence/e06-live-providers.json"},
 
-    "BDD-Q01": {"status": "deterministic", "tests": ["tests.test_deployment_release.DeploymentReleaseTests.test_bdd_q01_gate_checks_staged_diff_and_required_tools"]},
+    "BDD-Q01": {"status": "deterministic", "tests": ["tests.test_deployment_release.DeploymentReleaseTests.test_bdd_q01_gate_checks_staged_diff_and_required_tools", "tests.test_deployment_release.DeploymentReleaseTests.test_bdd_q01_cleanup_preserves_mounted_or_unknown_runtime"]},
     "BDD-Q01B": {"status": "deterministic", "tests": ["tests.test_deployment_release.DeploymentReleaseTests.test_bdd_q01b_documentation_matches_runtime_and_release_contract"]},
     "BDD-Q02": {"status": "deterministic", "tests": ["tests.test_deployment_release.DeploymentReleaseTests.test_bdd_q02_release_archive_is_exact_and_reproducible"]},
     "BDD-Q03": {"status": "external-gate", "tests": [], "receipt": ".release/evidence/q03-ci.json"},

@@ -42,16 +42,32 @@ gate_runtime=$(mktemp -d)
 chmod 0700 "$gate_runtime"
 release_commit=$(git rev-parse HEAD 2>/dev/null || true)
 cleanup_gate() {
-    local mountpoint
-    for mountpoint in "$gate_runtime/doc" "$gate_runtime/gvfs"; do
-        if mountpoint -q "$mountpoint" 2>/dev/null; then
-            fusermount3 -u -z "$mountpoint" ||
-                echo "quality-gate: warning: cannot unmount $mountpoint" >&2
+    local runtime_path mount_status can_remove=1
+    rm -f -- "$command_log" "$test_report"
+    if ! command -v mountpoint >/dev/null 2>&1; then
+        echo "quality-gate: warning: preserving $gate_runtime; mount status is unknown" >&2
+        return
+    fi
+    for runtime_path in "$gate_runtime/doc" "$gate_runtime/gvfs"; do
+        [[ -d "$runtime_path" && ! -L "$runtime_path" ]] || continue
+        mount_status=0
+        mountpoint -q "$runtime_path" 2>/dev/null || mount_status=$?
+        if ((mount_status == 0)); then
+            if fusermount3 -u -z "$runtime_path"; then
+                mount_status=0
+                mountpoint -q "$runtime_path" 2>/dev/null || mount_status=$?
+            fi
+        fi
+        if ((mount_status != 32)); then
+            can_remove=0
         fi
     done
-    rm -f "$command_log" "$test_report"
-    rm -rf "$gate_runtime" ||
-        echo "quality-gate: warning: cannot remove $gate_runtime" >&2
+    if ((can_remove == 1)); then
+        rm -rf --one-file-system -- "$gate_runtime" ||
+            echo "quality-gate: warning: cannot remove $gate_runtime" >&2
+    else
+        echo "quality-gate: warning: preserving $gate_runtime; mount status is mounted or unknown" >&2
+    fi
 }
 trap cleanup_gate EXIT
 
@@ -144,6 +160,7 @@ required_tools=(
     python3
     ruff
     shellcheck
+    mountpoint
     sha256sum
     desktop-file-validate
     bwrap

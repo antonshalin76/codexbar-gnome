@@ -919,29 +919,40 @@ class ProviderGatewayContractTests(_GatewayTestCase):
                 )
 
     def test_bdd_p03_runtime_has_no_shell_execution_path(self) -> None:
-        tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
-        violations: list[str] = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            function = node.func
-            if (
-                isinstance(function, ast.Attribute)
-                and isinstance(function.value, ast.Name)
-                and function.value.id == "os"
-                and function.attr in {"popen", "system"}
-            ):
-                violations.append(f"os.{function.attr}")
-            for keyword in node.keywords:
-                if keyword.arg != "shell":
-                    continue
-                if not (
-                    isinstance(keyword.value, ast.Constant)
-                    and keyword.value.value is False
-                ):
-                    violations.append("shell")
-
-        self.assertEqual(violations, [])
+        binary = self.root / 'bin ; $(touch "$CODEXBAR_SHELL_MARKER")' / "codexbar"
+        ledger, marker = self.root / "calls.jsonl", self.root / "shell-executed"
+        _write_strict_codexbar(binary)
+        executor = indicator.ProcessExecutor(
+            executable=binary, supervisor_path=MODULE_PATH
+        )
+        gateway = indicator.ProviderGateway(
+            executor, self.claude_settings, source="oauth"
+        )
+        self.addCleanup(gateway.close)
+        runtimes = ("codex", "grok", "claude", "antigravity")
+        environment = {
+            "CODEXBAR_FAKE_LEDGER": str(ledger),
+            "CODEXBAR_SHELL_MARKER": str(marker),
+        }
+        with (
+            patch.dict(os.environ, environment),
+            patch.object(
+                indicator.subprocess, "Popen", wraps=indicator.subprocess.Popen
+            ) as spawn,
+        ):
+            for runtime in runtimes:
+                with self.subTest(runtime=runtime):
+                    self.assertIsInstance(
+                        gateway.fetch(runtime), indicator.RuntimeResult
+                    )
+        self.assertFalse(marker.exists())
+        self.assertTrue(spawn.call_args_list)
+        for call in spawn.call_args_list:
+            self.assertIsInstance(call.args[0], (list, tuple))
+            self.assertFalse(call.kwargs.get("shell", False))
+        calls = [json.loads(line) for line in ledger.read_text().splitlines()]
+        self.assertEqual(calls[0], ["usage", "--help"])
+        self.assertEqual([args[2] for args in calls[1:]], list(runtimes))
 
     def test_bdd_p04_valid_output_becomes_typed_bounded_result(self) -> None:
         payload = [
