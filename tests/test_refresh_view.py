@@ -2303,7 +2303,7 @@ class IndicatorViewRedTests(unittest.TestCase):
                 raise RuntimeError("malformed timezone")
 
         malformed_datetimes = (
-            datetime(2030, 1, 1, tzinfo=None),  # malformed naive datetime fixture
+            datetime(2030, 1, 1, tzinfo=None),  # noqa: DTZ001 - deliberately invalid fixture
             datetime(2030, 1, 1, tzinfo=MissingOffset()),
             datetime(2030, 1, 1, tzinfo=RaisingOffset()),
         )
