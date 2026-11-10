@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import itertools
 import json
 import os
@@ -10,6 +11,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -1591,6 +1593,35 @@ finally:
         )
         self.assertEqual(validated.returncode, 0, validated.stderr)
 
+    def test_bdd_e02_process_count_excludes_all_supervisor_modes(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "codexbar_e2e_process_count", REPO_ROOT / "scripts/e2e-x11.py"
+        )
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        fixture = self.sandbox.root / "indicator-process"
+        fixture.write_text("import time\ntime.sleep(30)\n")
+        processes = []
+        try:
+            for arguments in (
+                (),
+                ("--child-supervisor",),
+                ("--child-supervisor-env-fd", "7"),
+            ):
+                processes.append(
+                    subprocess.Popen(
+                        [sys.executable, str(fixture), *arguments],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                )
+            self.assertTrue(all(process.poll() is None for process in processes))
+            self.assertEqual(runner.primary_process_count(fixture), 1)
+        finally:
+            for process in processes:
+                process.terminate()
+                process.wait(timeout=5)
+
     def test_bdd_e02_exact_artifact_x11_runner_has_explicit_contract(self) -> None:
         runner = REPO_ROOT / "scripts" / "e2e-x11.py"
         self.assertTrue(runner.is_file())
@@ -1734,7 +1765,7 @@ try:
             value = cmdline.read_bytes().split(b"\0")
         except OSError:
             continue
-        if str(installed).encode() in value and b"--child-supervisor" not in value:
+        if value[1:] == [str(installed).encode(), b""]:
             process_count += 1
 
     before = len(provider_records())

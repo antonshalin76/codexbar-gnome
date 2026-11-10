@@ -78,7 +78,7 @@
     "BDD-I09": {"status": "deterministic", "tests": ["tests.test_deployment_release.DeploymentReleaseTests.test_bdd_i09_installed_runtime_resolves_codexbar_from_path"]},
 
     "BDD-E01": {"status": "deterministic", "tests": ["tests.test_deployment_release.DeploymentReleaseTests.test_bdd_e01_coverage_manifest_is_complete_and_unambiguous"]},
-    "BDD-E02": {"status": "deterministic", "tests": ["tests.test_deployment_release.DeploymentReleaseTests.test_bdd_e02_exact_artifact_x11_runner_has_explicit_contract"]},
+    "BDD-E02": {"status": "deterministic", "tests": ["tests.test_deployment_release.DeploymentReleaseTests.test_bdd_e02_exact_artifact_x11_runner_has_explicit_contract", "tests.test_deployment_release.DeploymentReleaseTests.test_bdd_e02_process_count_excludes_all_supervisor_modes"]},
     "BDD-E03": {"status": "external-gate", "tests": [], "receipt": ".release/evidence/e03-wayland.json"},
     "BDD-E04": {"status": "deterministic", "tests": ["tests.test_refresh_view.RefreshCoordinatorRedTests.test_bdd_e04_provider_outage_recovery_has_no_hidden_retry"]},
     "BDD-E05": {"status": "deterministic", "tests": ["tests.test_refresh_view.ApplicationLifecycleRedTests.test_bdd_e05_missing_status_notifier_watcher_is_visible_and_quittable"]},

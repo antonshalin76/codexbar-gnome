@@ -478,7 +478,7 @@ def primary_process_count(installed: Path) -> int:
             arguments = cmdline.read_bytes().split(b"\0")
         except OSError:
             continue
-        if expected in arguments and b"--child-supervisor" not in arguments:
+        if arguments[1:] == [expected, b""]:
             count += 1
     return count
 
